@@ -326,8 +326,9 @@ def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = N
 class LivePreview:
     """
     Applies a color to all devices in a background thread.
-    The TUI posts requests; the thread always applies the latest one.
-    Uses fast=True for responsiveness; set_mode is skipped if already correct.
+    Fast devices (fast=True, no force_mode) use the main client connection.
+    Slow devices (force_mode=True) use a separate client connection and thread
+    so they never block the fast rainbow.
     """
 
     def __init__(self, client: OpenRGBClient) -> None:
@@ -337,10 +338,12 @@ class LivePreview:
         self._dev_state: dict = {}
         self._gc: dict = {}
         self._dirty = threading.Event()
+        self._force_dirty = threading.Event()
         self._stop = threading.Event()
-        self._modes_initialized: set[int] = set()  # device ids that got set_mode
         self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._force_thread = threading.Thread(target=self._loop_force, daemon=True)
         self._thread.start()
+        self._force_thread.start()
 
     def request(self, r: float, g: float, b: float,
                 dev_state: dict, gc: dict = {}) -> None:
@@ -349,11 +352,18 @@ class LivePreview:
             self._dev_state = dev_state
             self._gc = gc
         self._dirty.set()
+        self._force_dirty.set()
 
     def stop(self) -> None:
         self._stop.set()
         self._dirty.set()
-        self._thread.join()  # wait until fully dead — no timeout
+        self._force_dirty.set()
+        self._thread.join()
+        self._force_thread.join()
+
+    def _snapshot(self) -> tuple:
+        with self._lock:
+            return self._r, self._g, self._b, self._dev_state, self._gc
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -361,10 +371,7 @@ class LivePreview:
             self._dirty.clear()
             if self._stop.is_set():
                 break
-            with self._lock:
-                r, g, b = self._r, self._g, self._b
-                dev_state = self._dev_state
-                gc = self._gc
+            r, g, b, dev_state, gc = self._snapshot()
             r, g, b = apply_saturation(r, g, b, gc)
             _ns: dict[str, int] = {}
             for device in self._client.devices:
@@ -372,27 +379,66 @@ class LivePreview:
                 _ns[device.name] = _i + 1
                 _ik = f"{device.name} #{_i}"
                 dc = dev_state.get(_ik, dev_state.get(device.name, {}))
-                if dc.get("skip"):
-                    continue
+                if dc.get("skip") or dc.get("force_mode"):
+                    continue  # force_mode devices handled by _loop_force
                 try:
                     dr, dg, db = device_correction(r, g, b, dc)
                     if gc:
                         dr, dg, db = global_correction(dr, dg, db, gc)
                     color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
                     mode = dc.get("mode", "direct")
-                    force = dc.get("force_mode", False)
-                    did = id(device)
-                    if did not in self._modes_initialized:
-                        cur = device.modes[device.active_mode].name if device.modes else ""
-                        if force or cur.lower() != mode.lower():
-                            try:
-                                device.set_mode(mode)
-                            except Exception:
-                                pass
-                        self._modes_initialized.add(did)
+                    cur = device.modes[device.active_mode].name if device.modes else ""
+                    if cur.lower() != mode.lower():
+                        try:
+                            device.set_mode(mode)
+                        except Exception:
+                            pass
                     device.set_color(color, fast=True)
                 except Exception:
                     pass
+
+    def _loop_force(self) -> None:
+        # Separate OpenRGB connection so GPU updates never block the fast thread.
+        force_client: OpenRGBClient | None = None
+        try:
+            force_client = OpenRGBClient()
+        except Exception:
+            return  # can't connect — skip force devices silently
+
+        try:
+            while not self._stop.is_set():
+                self._force_dirty.wait(timeout=0.5)
+                self._force_dirty.clear()
+                if self._stop.is_set():
+                    break
+                r, g, b, dev_state, gc = self._snapshot()
+                r, g, b = apply_saturation(r, g, b, gc)
+                _ns: dict[str, int] = {}
+                for device in force_client.devices:
+                    _i = _ns.get(device.name, 0)
+                    _ns[device.name] = _i + 1
+                    _ik = f"{device.name} #{_i}"
+                    dc = dev_state.get(_ik, dev_state.get(device.name, {}))
+                    if dc.get("skip") or not dc.get("force_mode"):
+                        continue
+                    try:
+                        dr, dg, db = device_correction(r, g, b, dc)
+                        if gc:
+                            dr, dg, db = global_correction(dr, dg, db, gc)
+                        color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
+                        mode = dc.get("mode", "direct")
+                        try:
+                            device.set_mode(mode)
+                        except Exception:
+                            pass
+                        device.set_color(color, fast=True)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                force_client.disconnect()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
