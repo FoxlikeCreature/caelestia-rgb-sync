@@ -102,8 +102,20 @@ def device_correction(r: float, g: float, b: float, dc: dict) -> tuple[float, fl
     return tuple(out)
 
 
+def apply_saturation(r: float, g: float, b: float, gc: dict) -> tuple[float, float, float]:
+    """Boost HSV saturation of source color. Applied BEFORE device_correction."""
+    sat_boost = gc.get("saturation", 1.0)
+    if sat_boost == 1.0:
+        return r, g, b
+    _h, _s, _v = colorsys.rgb_to_hsv(r, g, b)
+    _s = clamp(_s * sat_boost)
+    return colorsys.hsv_to_rgb(_h, _s, _v)
+
+
 def global_correction(r: float, g: float, b: float, gc: dict) -> tuple[float, float, float]:
-    """Apply global pipeline: gain*brightness → gamma → color_temp → hue_corrections."""
+    """Apply global pipeline: gain*brightness → gamma → color_temp → hue_corrections.
+    Saturation is intentionally excluded — it is applied to the source color BEFORE
+    device_correction so that per-device gain compensation acts on the correct hue."""
     gain = gc.get("gain", [1.0, 1.0, 1.0])
     brightness = gc.get("brightness", 1.0)
     gamma = gc.get("gamma", 1.0)
@@ -119,12 +131,6 @@ def global_correction(r: float, g: float, b: float, gc: dict) -> tuple[float, fl
 
     kr, kg, kb = kelvin_multipliers(kelvin)
     r, g, b = clamp(r * kr), clamp(g * kg), clamp(b * kb)
-
-    sat_boost = gc.get("saturation", 1.0)
-    if sat_boost != 1.0:
-        _h, _s, _v = colorsys.rgb_to_hsv(r, g, b)
-        _s = clamp(_s * sat_boost)
-        r, g, b = colorsys.hsv_to_rgb(_h, _s, _v)
 
     h, s, _ = colorsys.rgb_to_hsv(r, g, b)
     for hc in gc.get("hue_corrections", []):
@@ -198,17 +204,21 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
 
     base_hex = read_scheme_color(source)
     r, g, b = hex_to_rgb(base_hex)
+    r, g, b = apply_saturation(r, g, b, gc)
     print(f"source: #{base_hex}  (${source})", flush=True)
 
     for device in client.devices:
         dc = find_device_cfg(device.name, devices_cfg)
         if dc.get("skip"):
             continue
-        dr, dg, db = device_correction(r, g, b, dc)
-        fr, fg, fb = global_correction(dr, dg, db, gc)
-        color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
-        set_device_color(device, color, dc, gc)
-        print(f"  {device.name:45s} #{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
+        try:
+            dr, dg, db = device_correction(r, g, b, dc)
+            fr, fg, fb = global_correction(dr, dg, db, gc)
+            color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
+            set_device_color(device, color, dc, gc)
+            print(f"  {device.name:45s} #{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
+        except Exception as e:
+            print(f"  {device.name}: error: {e}", file=sys.stderr, flush=True)
 
 
 def restore_wallpaper(client: OpenRGBClient, cfg: dict) -> None:
@@ -341,9 +351,8 @@ class LivePreview:
                 r, g, b = self._r, self._g, self._b
                 dev_state = self._dev_state
                 gc = self._gc
+            r, g, b = apply_saturation(r, g, b, gc)
             for device in self._client.devices:
-                if self._stop.is_set():
-                    break  # abort mid-batch so stop() doesn't race with restore
                 dc = dev_state.get(device.name, {})
                 if dc.get("skip"):
                     continue
