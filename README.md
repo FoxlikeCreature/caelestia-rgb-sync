@@ -76,24 +76,31 @@ systemctl --user enable --now caelestia-rgb.service
 `~/.config/caelestia-rgb/config.toml`
 
 ```toml
-# Which variable to read from the caelestia scheme file.
-# primaryPaletteKeyColor is the main wallpaper accent color.
 color_source = "primaryPaletteKeyColor"
 
-# Global correction - applied to every device before per-device overrides.
+# Global corrections - applied to every device.
+# Each channel: scale (multiplier), floor (minimum), ceil (maximum).
+# HSV channels are applied first, RGB channels on the result.
 [global]
-s_mul = 1.55   # boost saturation - LEDs look washed out vs screen
-v_min = 0.70   # never go darker than 70% brightness
-v_max = 0.95   # leave headroom to avoid pure white
+s = { scale = 1.55, floor = 0.55 }   # boost saturation; floor prevents white on pale colors
+v = { floor = 0.70, ceil = 0.95 }    # brightness window
 
-# Per-device overrides - matched by substring of device name (case-insensitive).
-# The correction here is applied on top of [global], not instead of it.
-# Any channel can be omitted - defaults are mul=1.0, min=0.0, max=1.0.
+# Hue-range corrections - applied after global, selected by source color hue (0.0-1.0):
+#   0.00 red    0.08 orange   0.17 yellow   0.33 green
+#   0.50 cyan   0.67 blue     0.75 purple   0.83 magenta
+[[hue_ranges]]
+name = "yellow-orange"
+from = 0.05
+to   = 0.20
+s    = { ceil = 0.55 }   # warm colors go oversaturated on LEDs
+
+# Per-device corrections - applied last, on top of global + hue_range.
 [[devices]]
 match = "ENE DRAM"
 mode  = "direct"
-s_mul = 1.3
-g_mul = 0.70   # ENE controllers have a strong green channel
+s     = { scale = 1.30 }
+h     = { scale = 0.90 }
+g     = { scale = 0.70 }   # ENE controllers have a strong green channel
 
 [[devices]]
 match = "Radeon RX"
@@ -104,18 +111,26 @@ fast       = false  # wait for hardware acknowledgment
 
 ### Channel reference
 
-All corrections work the same way: `value = clamp(value * mul, min, max)`
+Each channel takes an inline table with up to three keys. All are optional - omit what you don't need.
 
-HSV corrections happen first (in HSV color space), then RGB corrections are applied to the result.
+`value = clamp(value * scale, floor, ceil)`
 
-| Key | What it affects |
-|-----|----------------|
-| `h_mul`, `h_min`, `h_max` | Hue (0-1, wraps around the color wheel) |
-| `s_mul`, `s_min`, `s_max` | Saturation |
-| `v_mul`, `v_min`, `v_max` | Value (brightness) |
-| `r_mul`, `r_min`, `r_max` | Red channel |
-| `g_mul`, `g_min`, `g_max` | Green channel |
-| `b_mul`, `b_min`, `b_max` | Blue channel |
+HSV channels are corrected first, then RGB channels on the result.
+
+| Channel | Affects |
+|---------|---------|
+| `h` | Hue (0.0-1.0, full color wheel) |
+| `s` | Saturation |
+| `v` | Value (brightness) |
+| `r` | Red |
+| `g` | Green |
+| `b` | Blue |
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `scale` | `1.0` | Multiply the channel value |
+| `floor` | `0.0` | Clamp minimum |
+| `ceil` | `1.0` | Clamp maximum |
 
 ### Device-specific options
 

@@ -38,19 +38,24 @@ def read_scheme_color(variable: str) -> str:
     return m.group(1)
 
 
-def apply_correction(r: float, g: float, b: float, params: dict) -> tuple[float, float, float]:
-    """Apply one layer of correction (mul + min/max clamp) to an RGB triple (0..1).
+def _ch(params: dict, key: str) -> dict:
+    return params.get(key, {})
 
-    HSV channels are corrected in HSV space, then RGB channels on the result.
-    """
+
+def _apply_channel(v: float, ch: dict) -> float:
+    v = v * ch.get("scale", 1.0)
+    return min(max(v, ch.get("floor", 0.0)), ch.get("ceil", 1.0))
+
+
+def apply_correction(r: float, g: float, b: float, params: dict) -> tuple[float, float, float]:
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    h = min(max(h * params.get("h_mul", 1.0), params.get("h_min", 0.0)), params.get("h_max", 1.0))
-    s = min(max(s * params.get("s_mul", 1.0), params.get("s_min", 0.0)), params.get("s_max", 1.0))
-    v = min(max(v * params.get("v_mul", 1.0), params.get("v_min", 0.0)), params.get("v_max", 1.0))
+    h = _apply_channel(h, _ch(params, "h"))
+    s = _apply_channel(s, _ch(params, "s"))
+    v = _apply_channel(v, _ch(params, "v"))
     r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    r = min(max(r * params.get("r_mul", 1.0), params.get("r_min", 0.0)), params.get("r_max", 1.0))
-    g = min(max(g * params.get("g_mul", 1.0), params.get("g_min", 0.0)), params.get("g_max", 1.0))
-    b = min(max(b * params.get("b_mul", 1.0), params.get("b_min", 0.0)), params.get("b_max", 1.0))
+    r = _apply_channel(r, _ch(params, "r"))
+    g = _apply_channel(g, _ch(params, "g"))
+    b = _apply_channel(b, _ch(params, "b"))
     return r, g, b
 
 
@@ -60,6 +65,19 @@ def hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
         int(hex_color[2:4], 16) / 255,
         int(hex_color[4:6], 16) / 255,
     )
+
+
+def find_hue_range_cfg(hue: float, ranges: list[dict]) -> dict:
+    for r in ranges:
+        lo = r.get("from", 0.0)
+        hi = r.get("to", 1.0)
+        if lo <= hi:
+            if lo <= hue <= hi:
+                return r
+        else:  # wrap-around through 0 (e.g. red: from=0.95 to=0.05)
+            if hue >= lo or hue <= hi:
+                return r
+    return {}
 
 
 def find_device_cfg(name: str, overrides: list[dict]) -> dict:
@@ -84,12 +102,16 @@ def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
 def apply_all(client: OpenRGBClient, cfg: dict) -> None:
     source    = cfg.get("color_source", "primaryPaletteKeyColor")
     global_p  = cfg.get("global", {})
+    hue_ranges = cfg.get("hue_ranges", [])
     overrides = cfg.get("devices", [])
 
     base_hex = read_scheme_color(source)
-    print(f"source color: #{base_hex}  (${source})", flush=True)
-
     base_rgb = hex_to_rgb(base_hex)
+    base_hue = colorsys.rgb_to_hsv(*base_rgb)[0]
+
+    hue_cfg = find_hue_range_cfg(base_hue, hue_ranges)
+    hue_label = f" [{hue_cfg.get('name', '')}]" if hue_cfg else ""
+    print(f"source color: #{base_hex}  (${source}){hue_label}", flush=True)
 
     for device in client.devices:
         dev_cfg   = find_device_cfg(device.name, overrides)
@@ -100,8 +122,9 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
         force_mode  = dev_cfg.get("force_mode",  global_p.get("force_mode",  False))
         fast        = dev_cfg.get("fast",        global_p.get("fast",        True))
 
-        # Two-pass correction: global first, then per-device on top.
+        # Three-pass correction: global -> hue_range -> per-device.
         r, g, b = apply_correction(*base_rgb, global_p)
+        r, g, b = apply_correction(r, g, b, hue_cfg)
         r, g, b = apply_correction(r, g, b, dev_cfg)
         color = RGBColor(int(r * 255), int(g * 255), int(b * 255))
 
