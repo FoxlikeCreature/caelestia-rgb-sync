@@ -120,6 +120,12 @@ def global_correction(r: float, g: float, b: float, gc: dict) -> tuple[float, fl
     kr, kg, kb = kelvin_multipliers(kelvin)
     r, g, b = clamp(r * kr), clamp(g * kg), clamp(b * kb)
 
+    sat_boost = gc.get("saturation", 1.0)
+    if sat_boost != 1.0:
+        _h, _s, _v = colorsys.rgb_to_hsv(r, g, b)
+        _s = clamp(_s * sat_boost)
+        r, g, b = colorsys.hsv_to_rgb(_h, _s, _v)
+
     h, s, _ = colorsys.rgb_to_hsv(r, g, b)
     for hc in gc.get("hue_corrections", []):
         hc_gain = hc.get("gain", [1.0, 1.0, 1.0])
@@ -394,6 +400,7 @@ def cmd_init(_args) -> int:
             "color_temperature": 6500,
             "gain": [1.0, 1.0, 1.0],
             "gamma": 1.0,
+            "saturation": 1.0,
             "hue_corrections": [],
         },
     }
@@ -588,7 +595,8 @@ def cmd_calibrate_device(args) -> int:
     rows = [(name, ch) for name in active_names for ch in range(3)]
 
     def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
-                    hint1: str, hint2: str, header: str) -> None:
+                    hint1: str, hint2: str, header: str,
+                    preview_saturation: float = 1.0) -> None:
         """Shared table body used by both draw modes."""
         stdscr.erase()
         W = stdscr.getmaxyx()[1]
@@ -628,7 +636,7 @@ def cmd_calibrate_device(args) -> int:
                 line(display_row, "")
                 display_row += 1
 
-        line(display_row,     f"Up/Dn: channel   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})")
+        line(display_row,     f"Up/Dn: channel   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})")
         line(display_row + 1, hint2)
         try:
             stdscr.addstr(display_row + 2, 0, ("+" + "-" * (W - 2) + "+")[:W])
@@ -636,7 +644,8 @@ def cmd_calibrate_device(args) -> int:
             pass
         stdscr.refresh()
 
-    def draw_step(stdscr, step_idx: int, row_idx: int, field_idx: int, step_size_idx: int) -> None:
+    def draw_step(stdscr, step_idx: int, row_idx: int, field_idx: int, step_size_idx: int,
+                  preview_saturation: float = 1.0) -> None:
         label, _sr, _sg, _sb = CAL_STEPS[step_idx]
         total = len(CAL_STEPS)
         _draw_table(
@@ -644,14 +653,17 @@ def cmd_calibrate_device(args) -> int:
             hint1=f"All devices: {label}. Adjust R/G/B per device to match brightness and hue.",
             hint2="Enter: next color   q: cancel",
             header=f"Device calibration - {label} ({step_idx+1}/{total})",
+            preview_saturation=preview_saturation,
         )
 
-    def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int) -> None:
+    def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int,
+                    preview_saturation: float = 1.0) -> None:
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
             hint1=f"a/d: hue ({hue*360:.0f} deg)   scrub across the color wheel to find problem hues.",
             hint2="Enter: save   q: cancel",
             header="Device calibration - smooth",
+            preview_saturation=preview_saturation,
         )
 
     result: dict | None = None
@@ -665,14 +677,16 @@ def cmd_calibrate_device(args) -> int:
         preview = LivePreview(client)
 
         preview_brightness = 1.0
+        preview_saturation = cfg.get("global", {}).get("saturation", 1.0)
 
         if smooth:
             hue = 0.0
             sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                            dev_state, gc={"saturation": preview_saturation})
 
             while True:
-                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx)
+                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, preview_saturation)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -697,32 +711,47 @@ def cmd_calibrate_device(args) -> int:
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('s'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('a'):
                     hue = (hue - HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('d'):
                     hue = (hue + HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
+                elif key == ord('['):
+                    preview_saturation = max(0.5, round(preview_saturation - 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
+                elif key == ord(']'):
+                    preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('='), ord('+')):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('-'), ord('_')):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
 
         else:
             step_idx = 0
             label, sr, sg, sb = CAL_STEPS[step_idx]
-            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                            dev_state, gc={"saturation": preview_saturation})
 
             while step_idx < len(CAL_STEPS):
-                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx)
+                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, preview_saturation)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -741,23 +770,36 @@ def cmd_calibrate_device(args) -> int:
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('s'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
+                elif key == ord('['):
+                    preview_saturation = max(0.5, round(preview_saturation - 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
+                elif key == ord(']'):
+                    preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
                 elif key in (ord('='), ord('+')):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('-'), ord('_')):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (10, 13, curses.KEY_ENTER):
                     step_idx += 1
                     if step_idx < len(CAL_STEPS):
                         label, sr, sg, sb = CAL_STEPS[step_idx]
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                        dev_state, gc={"saturation": preview_saturation})
                         row_idx = field_idx = 0
 
             preview.stop()
@@ -819,6 +861,7 @@ GLOBAL_PARAMS = [
     ("gain_g",            "gain G",             0.01,  0.0,   4.0),
     ("gain_b",            "gain B",             0.01,  0.0,   4.0),
     ("gamma",             "gamma",              0.01,  0.1,   4.0),
+    ("saturation",        "saturation",         0.05,  0.5,   3.0),
 ]
 
 def _state_to_gcfg(state: dict, base_hue_corrections: list) -> dict:
@@ -827,6 +870,7 @@ def _state_to_gcfg(state: dict, base_hue_corrections: list) -> dict:
         "color_temperature": state["color_temperature"],
         "gain": [state["gain_r"], state["gain_g"], state["gain_b"]],
         "gamma": state["gamma"],
+        "saturation": state.get("saturation", 1.0),
         "hue_corrections": base_hue_corrections,
     }
 
@@ -882,6 +926,7 @@ def cmd_calibrate_global(args) -> int:
         "gain_g":            gcfg_orig.get("gain", [1.0, 1.0, 1.0])[1],
         "gain_b":            gcfg_orig.get("gain", [1.0, 1.0, 1.0])[2],
         "gamma":             gcfg_orig.get("gamma", 1.0),
+        "saturation":        gcfg_orig.get("saturation", 1.0),
     }
 
     # Snapshot device corrections for use in LivePreview
@@ -946,10 +991,98 @@ def cmd_calibrate_global(args) -> int:
             pass
         stdscr.refresh()
 
-    result: dict | None = None
+    _CORR_FIELD_LABELS = ["center", "width", "R", "G", "B"]
+
+    def draw_smooth_global(stdscr, hue: float, row_idx: int, corr_field_idx: int,
+                           preview_brightness: float, live_hue_corr: list) -> None:
+        stdscr.erase()
+        W = stdscr.getmaxyx()[1]
+        n_params = len(GLOBAL_PARAMS)
+        sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        hdr = f"Global calibration - smooth - hue: {hue*360:.0f} deg"
+
+        def line(r: int, text: str = "") -> None:
+            try:
+                stdscr.addstr(r, 0, ("| " + text).ljust(W - 1) + "|")
+            except curses.error:
+                pass
+
+        try:
+            stdscr.addstr(0, 0, ("+" + f" {hdr} ").ljust(W - 1, "-") + "+")
+        except curses.error:
+            pass
+        line(1, f"Adjust until LEDs match the block. w/s: brightness ({preview_brightness:.2f})")
+        line(2, "")
+
+        _draw_color_block(stdscr, 3, W,
+                          clamp(sr * preview_brightness),
+                          clamp(sg * preview_brightness),
+                          clamp(sb * preview_brightness))
+
+        line(3 + BLOCK_ROWS, "")
+
+        for i, (key, lbl, _step, _lo, _hi) in enumerate(GLOBAL_PARAMS):
+            v = state[key]
+            val_str = f"{v:.0f} K" if key == "color_temperature" else f"{v:.3f}"
+            is_sel = (i == row_idx)
+            text = f"  {'>' if is_sel else ' '} {lbl:<22} {val_str}"
+            attr = curses.A_BOLD if is_sel else curses.A_NORMAL
+            try:
+                stdscr.addstr(4 + BLOCK_ROWS + i, 0, ("| " + text).ljust(W - 1) + "|", attr)
+            except curses.error:
+                pass
+
+        base = 4 + BLOCK_ROWS + n_params
+        line(base, "")
+        try:
+            sep = ("-- Hue corrections " + "-" * max(0, W - 22))[:W - 3]
+            stdscr.addstr(base + 1, 0, ("| " + sep).ljust(W - 1) + "|")
+        except curses.error:
+            pass
+
+        for ci, hc in enumerate(live_hue_corr):
+            ri = n_params + ci
+            is_sel = (ri == row_idx)
+            center_deg = hc.get("hue_center", 0.0) * 360
+            width_deg  = hc.get("hue_width", 0.1) * 360
+            gain       = hc.get("gain", [1.0, 1.0, 1.0])
+            name       = hc.get("name", f"corr-{ci}")[:10]
+            parts = (f"ctr={center_deg:.0f}  wid={width_deg:.0f}  "
+                     f"R={gain[0]:.2f} G={gain[1]:.2f} B={gain[2]:.2f}")
+            if is_sel:
+                text = f"  > {name:<10} {parts}  [{_CORR_FIELD_LABELS[corr_field_idx]}]"
+            else:
+                text = f"    {name:<10} {parts}"
+            attr = curses.A_BOLD if is_sel else curses.A_NORMAL
+            try:
+                stdscr.addstr(base + 2 + ci, 0, ("| " + text).ljust(W - 1) + "|", attr)
+            except curses.error:
+                pass
+
+        add_row = base + 2 + len(live_hue_corr)
+        is_add_sel = (row_idx == n_params + len(live_hue_corr))
+        add_text = "  > [+ add at current hue]" if is_add_sel else "    [+ add at current hue]"
+        try:
+            stdscr.addstr(add_row, 0, ("| " + add_text).ljust(W - 1) + "|",
+                          curses.A_BOLD if is_add_sel else curses.A_NORMAL)
+        except curses.error:
+            pass
+
+        hint_base = add_row + 1
+        line(hint_base, "")
+        line(hint_base + 1, "a/d: hue   Up/Dn: row   Lft/Rgt: corr field   +/-: value")
+        line(hint_base + 2, "n: new corr   x: delete corr   Enter: save   q: cancel")
+        try:
+            stdscr.addstr(hint_base + 3, 0, ("+" + "-" * (W - 2) + "+")[:W])
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    result_state: dict | None = None
+    result_hue_corr: list = list(hue_corr)
 
     def run_tui(stdscr) -> bool:
-        nonlocal result
+        nonlocal result_state, result_hue_corr
         curses.curs_set(0)
         stdscr.keypad(True)
         curses.start_color()
@@ -960,41 +1093,56 @@ def cmd_calibrate_global(args) -> int:
         preview = LivePreview(client)
 
         if smooth:
+            live_hue_corr = [
+                {**hc, "gain": list(hc.get("gain", [1.0, 1.0, 1.0]))}
+                for hc in hue_corr
+            ]
             hue = 0.0
             sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            row_idx = 0
+            corr_field_idx = 0
+            n_params = len(GLOBAL_PARAMS)
+
+            CORR_FIELDS = [
+                ("hue_center", 2.0 / 360.0, 0.0,          1.0),
+                ("hue_width",  5.0 / 360.0, 1.0 / 360.0,  0.5),
+                ("gain_r",     0.05,          0.0,           2.0),
+                ("gain_g",     0.05,          0.0,           2.0),
+                ("gain_b",     0.05,          0.0,           2.0),
+            ]
+
+            def total_rows():
+                return n_params + len(live_hue_corr) + 1
+
             preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                            live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+                            live_dev_state, gc=_state_to_gcfg(state, live_hue_corr))
 
             while True:
-                draw(stdscr, step_idx=0, param_idx=param_idx,
-                     preview_brightness=preview_brightness,
-                     header=f"Global calibration - smooth - hue: {hue*360:.0f} deg",
-                     hint2="Enter: save   q: cancel",
-                     override_color=(sr, sg, sb))
+                draw_smooth_global(stdscr, hue, row_idx, corr_field_idx, preview_brightness, live_hue_corr)
                 key = stdscr.getch()
-                p_key, _, step_size, lo, hi = GLOBAL_PARAMS[param_idx]
 
                 def send_s() -> None:
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+                                    live_dev_state, gc=_state_to_gcfg(state, live_hue_corr))
 
                 if key == ord('q'):
                     preview.stop()
                     return False
                 elif key in (10, 13, curses.KEY_ENTER):
                     preview.stop()
-                    result = dict(state)
+                    result_state = dict(state)
+                    result_hue_corr = [dict(hc) for hc in live_hue_corr]
                     return True
                 elif key == curses.KEY_DOWN:
-                    param_idx = (param_idx + 1) % len(GLOBAL_PARAMS)
+                    row_idx = (row_idx + 1) % total_rows()
+                    corr_field_idx = 0
                 elif key == curses.KEY_UP:
-                    param_idx = (param_idx - 1) % len(GLOBAL_PARAMS)
-                elif key == ord('w'):
-                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
-                    send_s()
-                elif key == ord('s'):
-                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
-                    send_s()
+                    row_idx = (row_idx - 1) % total_rows()
+                    corr_field_idx = 0
+                elif key == curses.KEY_RIGHT and n_params <= row_idx < n_params + len(live_hue_corr):
+                    corr_field_idx = (corr_field_idx + 1) % len(CORR_FIELDS)
+                elif key == curses.KEY_LEFT and n_params <= row_idx < n_params + len(live_hue_corr):
+                    corr_field_idx = (corr_field_idx - 1) % len(CORR_FIELDS)
                 elif key == ord('a'):
                     hue = (hue - HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
@@ -1003,12 +1151,64 @@ def cmd_calibrate_global(args) -> int:
                     hue = (hue + HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
                     send_s()
+                elif key == ord('w'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    send_s()
+                elif key == ord('s'):
+                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
+                    send_s()
+                elif key == ord('n') or (
+                    key in (ord('='), ord('+')) and row_idx == n_params + len(live_hue_corr)
+                ):
+                    live_hue_corr.append({
+                        "name": f"corr-{int(hue * 360)}",
+                        "hue_center": round(hue, 4),
+                        "hue_width":  round(10.0 / 360.0, 4),
+                        "gain": [1.0, 1.0, 1.0],
+                    })
+                    row_idx = n_params + len(live_hue_corr) - 1
+                    corr_field_idx = 0
+                    send_s()
+                elif key == ord('x') and n_params <= row_idx < n_params + len(live_hue_corr):
+                    live_hue_corr.pop(row_idx - n_params)
+                    row_idx = min(row_idx, total_rows() - 1)
+                    send_s()
                 elif key in (ord('='), ord('+')):
-                    state[p_key] = min(hi, round(state[p_key] + step_size, 4))
-                    send_s()
+                    if row_idx < n_params:
+                        p_key, _, step_size, lo, hi = GLOBAL_PARAMS[row_idx]
+                        state[p_key] = min(hi, round(state[p_key] + step_size, 4))
+                        send_s()
+                    elif n_params <= row_idx < n_params + len(live_hue_corr):
+                        ci = row_idx - n_params
+                        cf_key, cf_step, cf_lo, cf_hi = CORR_FIELDS[corr_field_idx]
+                        hc = live_hue_corr[ci]
+                        if cf_key == "gain_r":
+                            hc["gain"][0] = min(cf_hi, round(hc["gain"][0] + cf_step, 4))
+                        elif cf_key == "gain_g":
+                            hc["gain"][1] = min(cf_hi, round(hc["gain"][1] + cf_step, 4))
+                        elif cf_key == "gain_b":
+                            hc["gain"][2] = min(cf_hi, round(hc["gain"][2] + cf_step, 4))
+                        else:
+                            hc[cf_key] = min(cf_hi, round(hc.get(cf_key, 0.0) + cf_step, 4))
+                        send_s()
                 elif key in (ord('-'), ord('_')):
-                    state[p_key] = max(lo, round(state[p_key] - step_size, 4))
-                    send_s()
+                    if row_idx < n_params:
+                        p_key, _, step_size, lo, hi = GLOBAL_PARAMS[row_idx]
+                        state[p_key] = max(lo, round(state[p_key] - step_size, 4))
+                        send_s()
+                    elif n_params <= row_idx < n_params + len(live_hue_corr):
+                        ci = row_idx - n_params
+                        cf_key, cf_step, cf_lo, cf_hi = CORR_FIELDS[corr_field_idx]
+                        hc = live_hue_corr[ci]
+                        if cf_key == "gain_r":
+                            hc["gain"][0] = max(cf_lo, round(hc["gain"][0] - cf_step, 4))
+                        elif cf_key == "gain_g":
+                            hc["gain"][1] = max(cf_lo, round(hc["gain"][1] - cf_step, 4))
+                        elif cf_key == "gain_b":
+                            hc["gain"][2] = max(cf_lo, round(hc["gain"][2] - cf_step, 4))
+                        else:
+                            hc[cf_key] = max(cf_lo, round(hc.get(cf_key, 0.0) - cf_step, 4))
+                        send_s()
 
         else:
             step_idx = 0
@@ -1055,7 +1255,7 @@ def cmd_calibrate_global(args) -> int:
                     send_n()
 
             preview.stop()
-            result = dict(state)
+            result_state = dict(state)
             return True
 
     while True:
@@ -1068,7 +1268,7 @@ def cmd_calibrate_global(args) -> int:
         if smooth:
             break  # smooth mode already served as visual check — skip sweep
         sweep_cfg = dict(cfg)
-        sweep_cfg["global"] = _state_to_gcfg(result, hue_corr)
+        sweep_cfg["global"] = _state_to_gcfg(result_state, result_hue_corr)
         action = verify_sweep(client, sweep_cfg)
         if action == "s":
             break
@@ -1083,10 +1283,12 @@ def cmd_calibrate_global(args) -> int:
     if "global" not in new_cfg:
         new_cfg["global"] = {}
     g = new_cfg["global"]
-    g["brightness"]        = result["brightness"]
-    g["color_temperature"] = int(result["color_temperature"])
-    g["gain"]              = [result["gain_r"], result["gain_g"], result["gain_b"]]
-    g["gamma"]             = result["gamma"]
+    g["brightness"]        = result_state["brightness"]
+    g["color_temperature"] = int(result_state["color_temperature"])
+    g["gain"]              = [result_state["gain_r"], result_state["gain_g"], result_state["gain_b"]]
+    g["gamma"]             = result_state["gamma"]
+    g["saturation"]        = result_state["saturation"]
+    g["hue_corrections"]   = result_hue_corr
 
     save_config(new_cfg)
     restore_wallpaper(client, load_config())

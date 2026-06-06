@@ -32,12 +32,15 @@ fast        = false
 # color_temperature : Kelvin; 6500 = neutral D65, lower = warmer, higher = cooler
 # gain=[R,G,B]      : global per-channel multipliers
 # gamma             : global gamma exponent applied uniformly
+# saturation        : HSV saturation multiplier applied after color_temperature
+#                     (1.0 = no change; 1.3-1.6 typical to compensate for LED desaturation)
 
 [global]
 brightness        = 1.0
 color_temperature = 6500
 gain              = [1.0, 1.0, 1.0]
 gamma             = 1.0
+saturation        = 1.0
 
 # Hue corrections - applied with linear falloff within hue_width.
 # hue_center : center of the affected hue range (0.0-1.0 wheel)
