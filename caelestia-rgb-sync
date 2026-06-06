@@ -207,8 +207,14 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
     r, g, b = apply_saturation(r, g, b, gc)
     print(f"source: #{base_hex}  (${source})", flush=True)
 
+    _ns: dict[str, int] = {}
     for device in client.devices:
-        dc = find_device_cfg(device.name, devices_cfg)
+        _i = _ns.get(device.name, 0)
+        _ns[device.name] = _i + 1
+        _ik = f"{device.name} #{_i}"
+        dc = devices_cfg.get(_ik)
+        if dc is None:
+            dc = find_device_cfg(device.name, devices_cfg)
         if dc.get("skip"):
             continue
         try:
@@ -355,8 +361,12 @@ class LivePreview:
                 dev_state = self._dev_state
                 gc = self._gc
             r, g, b = apply_saturation(r, g, b, gc)
+            _ns: dict[str, int] = {}
             for device in self._client.devices:
-                dc = dev_state.get(device.name, {})
+                _i = _ns.get(device.name, 0)
+                _ns[device.name] = _i + 1
+                _ik = f"{device.name} #{_i}"
+                dc = dev_state.get(_ik, dev_state.get(device.name, {}))
                 if dc.get("skip"):
                     continue
                 try:
@@ -371,7 +381,7 @@ class LivePreview:
                             device.set_mode(mode)
                         except Exception:
                             pass
-                    device.set_color(color, fast=True)
+                    device.set_color(color, fast=dc.get("fast", True))
                 except Exception:
                     pass
 
@@ -583,13 +593,31 @@ def cmd_calibrate_device(args) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
+    all_names = [d.name for d in client.devices]
+    name_counts: dict[str, int] = {}
+    for n in all_names:
+        name_counts[n] = name_counts.get(n, 0) + 1
+
     dev_state: dict[str, dict] = {}
-    active_names = []
+    active_keys: list[str] = []
+    devices_cfg = cfg.get("devices", {})
+    _ns: dict[str, int] = {}
+
     for d in client.devices:
-        orig = find_device_cfg(d.name, cfg.get("devices", {}))
-        if orig.get("skip"):
+        _i = _ns.get(d.name, 0)
+        _ns[d.name] = _i + 1
+        if name_counts[d.name] > 1:
+            cfg_key = f"{d.name} #{_i}"
+            orig = devices_cfg.get(cfg_key)
+            if orig is None:
+                orig = find_device_cfg(d.name, devices_cfg)
+        else:
+            cfg_key = d.name
+            orig = find_device_cfg(d.name, devices_cfg)
+        if (orig or {}).get("skip"):
             continue
-        dev_state[d.name] = {
+        orig = orig or {}
+        dev_state[cfg_key] = {
             "gain":        list(orig.get("gain",        [1.0, 1.0, 1.0])),
             "gamma":       list(orig.get("gamma",       [1.0, 1.0, 1.0])),
             "black_point": list(orig.get("black_point", [0.0, 0.0, 0.0])),
@@ -597,24 +625,38 @@ def cmd_calibrate_device(args) -> int:
             "force_mode":  orig.get("force_mode", False),
             "fast":        orig.get("fast", True),
         }
-        active_names.append(d.name)
+        active_keys.append(cfg_key)
 
-    if not active_names:
+    if not active_keys:
         print("No active devices found.", file=sys.stderr)
         client.disconnect()
         return 1
 
-    # Flat (device, channel) list for Up/Down navigation
-    rows = [(name, ch) for name in active_names for ch in range(3)]
+    # Each device: 3 channel rows + 1 fast row
+    rows: list[tuple[str, int | str]] = []
+    for k in active_keys:
+        for ch in range(3):
+            rows.append((k, ch))
+        rows.append((k, "fast"))
+
+    def _visual_h(start: int, end: int) -> int:
+        """Count visual lines for rows[start:end] (fast row adds a blank separator)."""
+        h = 0
+        for i in range(start, min(end, len(rows))):
+            _, ch = rows[i]
+            h += 1
+            if ch == "fast":
+                h += 1
+        return h
 
     def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
                     hint1: str, hint2: str, header: str,
-                    preview_saturation: float = 1.0) -> None:
-        """Shared table body used by both draw modes."""
+                    preview_saturation: float = 1.0,
+                    view_start: int = 0) -> None:
         stdscr.erase()
-        W = stdscr.getmaxyx()[1]
+        H, W = stdscr.getmaxyx()
 
-        def line(r: int, text: str) -> None:
+        def line(r: int, text: str = "") -> None:
             try:
                 stdscr.addstr(r, 0, ("| " + text).ljust(W - 1) + "|")
             except curses.error:
@@ -629,54 +671,64 @@ def cmd_calibrate_device(args) -> int:
         line(3, f"  {'Device':<32} ch   {'gain':>7}   {'gamma':>7}   {'blk_pt':>7}")
         line(4, f"  {'':32}        {'-------':>7}   {'-------':>7}   {'-------':>7}")
 
+        content_end = H - 3  # rows H-3, H-2, H-1 are hint + hint + border
         display_row = 5
         for ri, (name, ch) in enumerate(rows):
+            if ri < view_start:
+                continue
+            if display_row >= content_end:
+                break
             dc = dev_state[name]
             is_sel = ri == row_idx
             ch_marker = ">" if is_sel else " "
-            dev_display = name[:32] if ch == 0 else ""
-            vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
 
-            row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
-            for fi, v in enumerate(vals):
-                cell = f"{v:8.3f}   "
-                row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
-
-            _draw_device_row(stdscr, display_row, W, row_str)
-            display_row += 1
-
-            if ch == 2:
-                line(display_row, "")
+            if ch == "fast":
+                fast_val = "YES" if dc.get("fast", True) else " NO"
+                row_str = f"  {'':32} {ch_marker}fast: {fast_val}"
+                _draw_device_row(stdscr, display_row, W, row_str)
+                display_row += 1
+                if display_row < content_end:
+                    line(display_row)
+                    display_row += 1
+            else:
+                dev_display = name[:32] if ch == 0 else ""
+                vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
+                row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
+                for fi, v in enumerate(vals):
+                    cell = f"{v:8.3f}   "
+                    row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
+                _draw_device_row(stdscr, display_row, W, row_str)
                 display_row += 1
 
-        line(display_row,     f"Up/Dn: channel   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})")
-        line(display_row + 1, hint2)
+        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})   f: fast")
+        line(H - 2, hint2)
         try:
-            stdscr.addstr(display_row + 2, 0, ("+" + "-" * (W - 2) + "+")[:W])
+            stdscr.addstr(H - 1, 0, ("+" + "-" * (W - 2) + "+")[:W])
         except curses.error:
             pass
         stdscr.refresh()
 
     def draw_step(stdscr, step_idx: int, row_idx: int, field_idx: int, step_size_idx: int,
-                  preview_saturation: float = 1.0) -> None:
+                  preview_saturation: float = 1.0, view_start: int = 0) -> None:
         label, _sr, _sg, _sb = CAL_STEPS[step_idx]
-        total = len(CAL_STEPS)
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
             hint1=f"All devices: {label}. Adjust R/G/B per device to match brightness and hue.",
             hint2="Enter: next color   q: cancel",
-            header=f"Device calibration - {label} ({step_idx+1}/{total})",
+            header=f"Device calibration - {label} ({step_idx+1}/{len(CAL_STEPS)})",
             preview_saturation=preview_saturation,
+            view_start=view_start,
         )
 
     def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int,
-                    preview_saturation: float = 1.0) -> None:
+                    preview_saturation: float = 1.0, view_start: int = 0) -> None:
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
             hint1=f"a/d: hue ({hue*360:.0f} deg)   scrub across the color wheel to find problem hues.",
             hint2="Enter: save   q: cancel",
             header="Device calibration - smooth",
             preview_saturation=preview_saturation,
+            view_start=view_start,
         )
 
     result: dict | None = None
@@ -686,11 +738,20 @@ def cmd_calibrate_device(args) -> int:
         curses.curs_set(0)
         stdscr.keypad(True)
         row_idx = field_idx = step_size_idx = 0
+        view_start = 0
 
         preview = LivePreview(client)
-
         preview_brightness = 1.0
         preview_saturation = cfg.get("global", {}).get("saturation", 1.0)
+
+        def update_view(ri: int) -> None:
+            nonlocal view_start
+            content_h = max(1, curses.LINES - 9)
+            if ri < view_start:
+                view_start = ri
+                return
+            while _visual_h(view_start, ri + 1) > content_h and view_start < ri:
+                view_start += 1
 
         if smooth:
             hue = 0.0
@@ -699,7 +760,7 @@ def cmd_calibrate_device(args) -> int:
                             dev_state, gc={"saturation": preview_saturation})
 
             while True:
-                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, preview_saturation)
+                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, preview_saturation, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -714,11 +775,13 @@ def cmd_calibrate_device(args) -> int:
                     return True
                 elif key == curses.KEY_DOWN:
                     row_idx = (row_idx + 1) % len(rows)
+                    update_view(row_idx)
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
-                elif key == curses.KEY_RIGHT:
+                    update_view(row_idx)
+                elif key == curses.KEY_RIGHT and ch != "fast":
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key == curses.KEY_LEFT:
+                elif key == curses.KEY_LEFT and ch != "fast":
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
@@ -748,14 +811,22 @@ def cmd_calibrate_device(args) -> int:
                     preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
+                elif key == ord('f') and ch == "fast":
+                    dc["fast"] = not dc.get("fast", True)
                 elif key in (ord('='), ord('+')):
-                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    if ch == "fast":
+                        dc["fast"] = not dc.get("fast", True)
+                    else:
+                        dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                        dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('-'), ord('_')):
-                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    if ch == "fast":
+                        dc["fast"] = not dc.get("fast", True)
+                    else:
+                        dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                        dev_state, gc={"saturation": preview_saturation})
 
         else:
             step_idx = 0
@@ -764,7 +835,7 @@ def cmd_calibrate_device(args) -> int:
                             dev_state, gc={"saturation": preview_saturation})
 
             while step_idx < len(CAL_STEPS):
-                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, preview_saturation)
+                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, preview_saturation, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -773,13 +844,22 @@ def cmd_calibrate_device(args) -> int:
                 if key == ord('q'):
                     preview.stop()
                     return False
+                elif key in (10, 13, curses.KEY_ENTER):
+                    step_idx += 1
+                    if step_idx < len(CAL_STEPS):
+                        label, sr, sg, sb = CAL_STEPS[step_idx]
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                        dev_state, gc={"saturation": preview_saturation})
+                        row_idx = field_idx = view_start = 0
                 elif key == curses.KEY_DOWN:
                     row_idx = (row_idx + 1) % len(rows)
+                    update_view(row_idx)
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
-                elif key in (curses.KEY_RIGHT, ord('d')):
+                    update_view(row_idx)
+                elif key in (curses.KEY_RIGHT, ord('d')) and ch != "fast":
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key in (curses.KEY_LEFT, ord('a')):
+                elif key in (curses.KEY_LEFT, ord('a')) and ch != "fast":
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
@@ -799,21 +879,22 @@ def cmd_calibrate_device(args) -> int:
                                     dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
+                elif key == ord('f') and ch == "fast":
+                    dc["fast"] = not dc.get("fast", True)
                 elif key in (ord('='), ord('+')):
-                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('-'), ord('_')):
-                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (10, 13, curses.KEY_ENTER):
-                    step_idx += 1
-                    if step_idx < len(CAL_STEPS):
-                        label, sr, sg, sb = CAL_STEPS[step_idx]
+                    if ch == "fast":
+                        dc["fast"] = not dc.get("fast", True)
+                    else:
+                        dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
                         preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                         dev_state, gc={"saturation": preview_saturation})
-                        row_idx = field_idx = 0
+                elif key in (ord('-'), ord('_')):
+                    if ch == "fast":
+                        dc["fast"] = not dc.get("fast", True)
+                    else:
+                        dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                        dev_state, gc={"saturation": preview_saturation})
 
             preview.stop()
             result = dev_state
@@ -827,7 +908,6 @@ def cmd_calibrate_device(args) -> int:
             client.disconnect()
             return 0
         if smooth:
-            # smooth mode already served as the rainbow check — skip sweep
             break
         action = verify_sweep(client, cfg, dev_override=result)
         if action == "s":
@@ -837,18 +917,23 @@ def cmd_calibrate_device(args) -> int:
             restore_wallpaper(client, cfg)
             client.disconnect()
             return 0
-        # action == "r": loop back to TUI
 
     new_cfg = load_config()
     if "devices" not in new_cfg:
         new_cfg["devices"] = {}
+
+    # Remove stale non-indexed entries for devices that got split into #0/#1/...
+    indexed_bases = {re.sub(r'\s*#\d+$', '', name) for name in result if re.search(r'\s*#\d+$', name)}
+    for base in indexed_bases:
+        new_cfg["devices"].pop(base, None)
+
     for name, dc in result.items():
-        key = next((k for k in new_cfg["devices"] if k.lower() in name.lower()), name)
-        if key not in new_cfg["devices"]:
-            new_cfg["devices"][key] = {}
-        new_cfg["devices"][key]["gain"]        = dc["gain"]
-        new_cfg["devices"][key]["gamma"]       = dc["gamma"]
-        new_cfg["devices"][key]["black_point"] = dc["black_point"]
+        if name not in new_cfg["devices"]:
+            new_cfg["devices"][name] = {}
+        new_cfg["devices"][name]["gain"]        = dc["gain"]
+        new_cfg["devices"][name]["gamma"]       = dc["gamma"]
+        new_cfg["devices"][name]["black_point"] = dc["black_point"]
+        new_cfg["devices"][name]["fast"]        = dc["fast"]
 
     save_config(new_cfg)
     restore_wallpaper(client, load_config())
@@ -942,12 +1027,19 @@ def cmd_calibrate_global(args) -> int:
         "saturation":        gcfg_orig.get("saturation", 1.0),
     }
 
-    # Snapshot device corrections for use in LivePreview
-    live_dev_state = {
-        d.name: find_device_cfg(d.name, dev_cfgs)
-        for d in client.devices
-        if not find_device_cfg(d.name, dev_cfgs).get("skip")
-    }
+    # Snapshot device corrections for use in LivePreview (indexed to handle duplicate names)
+    live_dev_state: dict[str, dict] = {}
+    _ns: dict[str, int] = {}
+    for _d in client.devices:
+        _i = _ns.get(_d.name, 0)
+        _ns[_d.name] = _i + 1
+        _ik = f"{_d.name} #{_i}"
+        _dc = dev_cfgs.get(_ik)
+        if _dc is None:
+            _dc = find_device_cfg(_d.name, dev_cfgs)
+        if _dc.get("skip"):
+            continue
+        live_dev_state[_ik if _ik in dev_cfgs else _d.name] = _dc
 
     def draw(stdscr, step_idx: int, param_idx: int, preview_brightness: float,
              header: str = "", hint2: str = "Enter: next color   q: cancel",
