@@ -632,20 +632,19 @@ def cmd_calibrate_device(args) -> int:
         client.disconnect()
         return 1
 
-    # Each device: 3 channel rows + 1 fast row
-    rows: list[tuple[str, int | str]] = []
+    # Each device: 3 channel rows (R, G, B)
+    rows: list[tuple[str, int]] = []
     for k in active_keys:
         for ch in range(3):
             rows.append((k, ch))
-        rows.append((k, "fast"))
 
     def _visual_h(start: int, end: int) -> int:
-        """Count visual lines for rows[start:end] (fast row adds a blank separator)."""
+        """Count visual lines for rows[start:end] (separator after B row)."""
         h = 0
         for i in range(start, min(end, len(rows))):
             _, ch = rows[i]
             h += 1
-            if ch == "fast":
+            if ch == 2:
                 h += 1
         return h
 
@@ -681,26 +680,19 @@ def cmd_calibrate_device(args) -> int:
             dc = dev_state[name]
             is_sel = ri == row_idx
             ch_marker = ">" if is_sel else " "
-
-            if ch == "fast":
-                fast_val = "YES" if dc.get("fast", True) else " NO"
-                row_str = f"  {'':32} {ch_marker}fast: {fast_val}"
-                _draw_device_row(stdscr, display_row, W, row_str)
-                display_row += 1
-                if display_row < content_end:
-                    line(display_row)
-                    display_row += 1
-            else:
-                dev_display = name[:32] if ch == 0 else ""
-                vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
-                row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
-                for fi, v in enumerate(vals):
-                    cell = f"{v:8.3f}   "
-                    row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
-                _draw_device_row(stdscr, display_row, W, row_str)
+            dev_display = name[:32] if ch == 0 else ""
+            vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
+            row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
+            for fi, v in enumerate(vals):
+                cell = f"{v:8.3f}   "
+                row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
+            _draw_device_row(stdscr, display_row, W, row_str)
+            display_row += 1
+            if ch == 2 and display_row < content_end:
+                line(display_row)
                 display_row += 1
 
-        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})   f: fast")
+        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})")
         line(H - 2, hint2)
         try:
             stdscr.addstr(H - 1, 0, ("+" + "-" * (W - 2) + "+")[:W])
@@ -779,9 +771,9 @@ def cmd_calibrate_device(args) -> int:
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
                     update_view(row_idx)
-                elif key == curses.KEY_RIGHT and ch != "fast":
+                elif key == curses.KEY_RIGHT:
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key == curses.KEY_LEFT and ch != "fast":
+                elif key == curses.KEY_LEFT:
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
@@ -811,22 +803,14 @@ def cmd_calibrate_device(args) -> int:
                     preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key == ord('f') and ch == "fast":
-                    dc["fast"] = not dc.get("fast", True)
                 elif key in (ord('='), ord('+')):
-                    if ch == "fast":
-                        dc["fast"] = not dc.get("fast", True)
-                    else:
-                        dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                        dev_state, gc={"saturation": preview_saturation})
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('-'), ord('_')):
-                    if ch == "fast":
-                        dc["fast"] = not dc.get("fast", True)
-                    else:
-                        dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                        dev_state, gc={"saturation": preview_saturation})
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
 
         else:
             step_idx = 0
@@ -857,9 +841,9 @@ def cmd_calibrate_device(args) -> int:
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
                     update_view(row_idx)
-                elif key in (curses.KEY_RIGHT, ord('d')) and ch != "fast":
+                elif key in (curses.KEY_RIGHT, ord('d')):
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key in (curses.KEY_LEFT, ord('a')) and ch != "fast":
+                elif key in (curses.KEY_LEFT, ord('a')):
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
@@ -879,22 +863,14 @@ def cmd_calibrate_device(args) -> int:
                                     dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
-                elif key == ord('f') and ch == "fast":
-                    dc["fast"] = not dc.get("fast", True)
                 elif key in (ord('='), ord('+')):
-                    if ch == "fast":
-                        dc["fast"] = not dc.get("fast", True)
-                    else:
-                        dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                        dev_state, gc={"saturation": preview_saturation})
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
                 elif key in (ord('-'), ord('_')):
-                    if ch == "fast":
-                        dc["fast"] = not dc.get("fast", True)
-                    else:
-                        dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                        dev_state, gc={"saturation": preview_saturation})
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
 
             preview.stop()
             result = dev_state
