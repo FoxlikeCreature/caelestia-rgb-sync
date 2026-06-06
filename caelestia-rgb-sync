@@ -470,10 +470,16 @@ def cmd_devices(_args) -> int:
 
 def cmd_init(_args) -> int:
     try:
-        client = connect(retries=3, delay=1.0)
-    except RuntimeError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
+        client = connect(retries=1, delay=0.5)
+    except RuntimeError:
+        print("OpenRGB not running, starting via systemd...", flush=True)
+        import subprocess
+        subprocess.run(["systemctl", "--user", "start", "openrgb.service"], check=False)
+        try:
+            client = connect(retries=10, delay=1.5)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
 
     if CONFIG_PATH.exists():
         print(f"Config already exists at {CONFIG_PATH}. Remove it first to reinitialize.")
