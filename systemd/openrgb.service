@@ -4,7 +4,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/openrgb --startminimized --server
+ExecStart=/usr/bin/openrgb --server
+Environment=QT_QPA_PLATFORM=offscreen
 Restart=on-failure
 RestartSec=3
 
