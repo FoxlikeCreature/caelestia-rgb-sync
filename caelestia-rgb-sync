@@ -259,14 +259,24 @@ def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = N
 
     def _apply_hue(hue: float) -> None:
         r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        _ns: dict[str, int] = {}
         for device in client.devices:
-            dc = find_device_cfg(device.name, dev_cfgs)
+            _i = _ns.get(device.name, 0)
+            _ns[device.name] = _i + 1
+            _ik = f"{device.name} #{_i}"
+            dc = dev_cfgs.get(_ik)
+            if dc is None:
+                dc = find_device_cfg(device.name, dev_cfgs)
+            else:
+                _base = find_device_cfg(device.name, dev_cfgs)
+                if _base and id(_base) != id(dc):
+                    dc = {**_base, **dc}
             if dc.get("skip"):
                 continue
-            dr, dg, db = device_correction(r, g, b, dc)
-            fr, fg, fb = global_correction(dr, dg, db, gc)
-            color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
             try:
+                dr, dg, db = device_correction(r, g, b, dc)
+                fr, fg, fb = global_correction(dr, dg, db, gc)
+                color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
                 set_device_color(device, color, dc, gc)
             except Exception:
                 pass
@@ -313,7 +323,7 @@ def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = N
                 result[0] = "s"
                 return
 
-            time.sleep(0.05)
+            time.sleep(0.04)
 
     curses.wrapper(run)
     return result[0]
