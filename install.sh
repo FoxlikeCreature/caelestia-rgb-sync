@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# install.sh - install caelestia-rgb-sync
+# install.sh - manual install (for users who cloned the repo directly)
+# AUR users: use yay -S caelestia-rgb-sync instead
 
 set -e
 
 BIN="$HOME/.local/bin/caelestia-rgb-sync"
-CFG_DIR="$HOME/.config/caelestia-rgb"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 
 echo "Installing caelestia-rgb-sync..."
@@ -14,21 +14,27 @@ echo "  installed $BIN"
 
 install -Dm644 systemd/openrgb.service "$SYSTEMD_DIR/openrgb.service"
 install -Dm644 systemd/caelestia-rgb.service "$SYSTEMD_DIR/caelestia-rgb.service"
-echo "  installed systemd units"
 
-if [ ! -f "$CFG_DIR/config.toml" ]; then
-    install -Dm644 config.example.toml "$CFG_DIR/config.toml"
-    echo "  installed default config to $CFG_DIR/config.toml"
-else
-    echo "  skipped config (already exists at $CFG_DIR/config.toml)"
-fi
+# For manual installs, patch the service to use ~/.local/bin instead of /usr/bin
+sed -i "s|ExecStart=/usr/bin/|ExecStart=$HOME/.local/bin/|" \
+    "$SYSTEMD_DIR/caelestia-rgb.service"
+echo "  installed systemd units"
 
 systemctl --user daemon-reload
 systemctl --user enable --now openrgb.service
+
 echo "  waiting for OpenRGB to start..."
-sleep 10
+for i in $(seq 1 15); do
+    sleep 1
+    if systemctl --user is-active --quiet openrgb.service; then
+        echo "  OpenRGB is up"
+        break
+    fi
+    echo "  waiting... ($i/15)"
+done
+
 systemctl --user enable --now caelestia-rgb.service
 
 echo ""
-echo "Done. Edit $CFG_DIR/config.toml to tune colors per device."
-echo "Apply changes without rebooting: touch ~/.local/share/caelestia/hypr/scheme/current.conf"
+echo "Done. Run 'caelestia-rgb-sync init' to detect devices and create your config."
+echo "Then run 'caelestia-rgb-sync calibrate device' to calibrate per-device colors."
