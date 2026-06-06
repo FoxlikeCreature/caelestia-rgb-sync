@@ -381,7 +381,7 @@ class LivePreview:
                             device.set_mode(mode)
                         except Exception:
                             pass
-                    device.set_color(color, fast=dc.get("fast", True))
+                    device.set_color(color, fast=True)
                 except Exception:
                     pass
 
