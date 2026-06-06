@@ -12,17 +12,18 @@ Color pipeline per device:
 
 ```
 wallpaper accent hex
-  -> device.gain       (per-channel R/G/B multiplier)
-  -> device.gamma      (per-channel gamma curve)
+  -> global.saturation  (HSV saturation boost, compensates for LED desaturation)
+  -> device.gain        (per-channel R/G/B multiplier)
+  -> device.gamma       (per-channel gamma curve)
   -> device.black_point (per-channel minimum PWM floor)
   -> global.gain * global.brightness
   -> global.gamma
   -> color_temperature  (Kelvin correction, 6500 K = neutral)
-  -> hue_corrections   (selective per-hue gain with linear falloff)
+  -> hue_corrections    (selective per-hue gain with linear falloff)
   -> LED color
 ```
 
-All corrections are multiplicative. `black_point` is a minimum output floor applied after `gain` and `gamma`.
+Saturation is applied first so per-device corrections work on an already-boosted color. All other corrections are multiplicative. `black_point` is a minimum output floor applied after `gain` and `gamma`.
 
 ## Requirements
 
@@ -94,7 +95,7 @@ color_source = "primaryPaletteKeyColor"
 
 # Per-device normalization - makes all devices show the same color.
 # gain=[R,G,B]        : compensate for LED channel brightness differences
-# gamma=[R,G,B]       : per-channel gamma (1.0 = linear)
+# gamma=[R,G,B]       : per-channel gamma (1.0 = linear, <1 lightens, >1 darkens)
 # black_point=[R,G,B] : minimum PWM floor AFTER gain+gamma
 # mode, force_mode, fast, skip : OpenRGB control flags
 
@@ -104,24 +105,27 @@ gamma       = [1.0, 1.0, 1.0]
 black_point = [0.0, 0.0, 0.0]
 mode        = "direct"
 
-[devices."Radeon RX"]
+[devices."Your GPU"]
 gain        = [1.0, 1.0, 1.0]
 gamma       = [1.0, 1.0, 1.0]
 black_point = [0.0, 0.0, 0.0]
 mode        = "direct"
+force_mode  = true   # see Device flags below
 fast        = false
 
 # Global corrections applied after per-device normalization.
 # brightness        : overall brightness multiplier
-# color_temperature : Kelvin (6500 = neutral D65)
+# color_temperature : Kelvin (6500 = neutral D65, lower = warmer, higher = cooler)
 # gain=[R,G,B]      : global per-channel multipliers
 # gamma             : global gamma exponent
+# saturation        : HSV saturation multiplier (1.3-1.6 typical for LED compensation)
 
 [global]
 brightness        = 1.0
 color_temperature = 6500
 gain              = [1.0, 1.0, 1.0]
 gamma             = 1.0
+saturation        = 1.4
 
 # Hue corrections with linear falloff within hue_width.
 # hue_center/hue_width : affected range on the color wheel (0.0-1.0)
@@ -140,14 +144,20 @@ gain       = [1.0, 0.7, 0.0]
 | Key | Default | Description |
 |-----|---------|-------------|
 | `mode` | `"direct"` | OpenRGB mode name |
-| `force_mode` | `false` | Always call set_mode before update |
-| `fast` | `true` | Skip hardware ack (set false for some I2C GPU headers) |
-| `skip` | `false` | Exclude this device |
+| `force_mode` | `false` | Call set_mode before every color update — use if the device ignores commands (see warning below) |
+| `fast` | `true` | Skip waiting for hardware ack — set `false` for some GPU RGB controllers |
+| `skip` | `false` | Exclude this device entirely |
+
+> **`force_mode` warning:** enabling this on a device makes every color update issue a `set_mode` command first, which takes ~80 ms per device. During calibration preview, `force_mode` devices are updated on a separate thread so the live rainbow stays smooth, but they will visibly lag behind other devices. Only enable it if the device ignores color commands without it.
+
+### Same-named devices
+
+If you have multiple identical devices (e.g. two RAM sticks both called `ENE DRAM`), the script automatically tracks them by index. The config uses `"ENE DRAM #0"` and `"ENE DRAM #1"` as keys. The calibration TUI splits them automatically - you do not need to write these keys by hand.
 
 ### Reload without wallpaper change
 
 ```sh
-touch ~/.local/share/caelestia/hypr/scheme/current.conf
+caelestia-rgb-sync apply
 ```
 
 ## Calibration
@@ -161,38 +171,56 @@ LEDs have a very different color gamut from a monitor. Calibration brings them i
 Goal: make all devices show the same color when given the same input.
 
 ```sh
-caelestia-rgb-sync calibrate device
+caelestia-rgb-sync calibrate device           # smooth mode (default)
+caelestia-rgb-sync calibrate device --steps   # fixed color steps
 ```
 
-The TUI cycles through R, G, B channels. Each step lights all devices in a single pure channel (red, then green, then blue). Adjust `gain`, `gamma`, and `black_point` for each device until brightness matches across all of them.
+**Smooth mode** (default) — scrub freely across the color wheel with `a`/`d`. Best for finding problem hues and correcting channel imbalances interactively. You see the effect on all devices in real time as you move the hue.
+
+**Steps mode** (`--steps`) — cycles through fixed pure colors (red, green, blue, yellow, cyan, magenta) one by one. Useful for systematic per-channel calibration: set red gain until all devices match on red, then green, then blue. After all steps, a rainbow sweep runs for visual verification.
 
 Controls:
-- `w/s` or `Up/Down` - select device
-- `a/d` or `Left/Right` - select field (gain / gamma / black_point)
+- `Up/Down` - select row (device channel or force_mode toggle)
+- `Left/Right` - select field (gain / gamma / black_point)
 - `+` / `-` - increase / decrease value
 - `Tab` - cycle step size (0.05 / 0.01 / 0.001)
-- `Enter` - confirm and move to next channel
+- `f` - toggle `force_mode` for the selected device
+- `w` / `s` - increase / decrease preview brightness
+- `a` / `d` - scrub hue (smooth mode only)
+- `Enter` - confirm / save
 - `q` - cancel
-
-After all three channels, a rainbow sweep runs for visual verification. Press `Enter` to save or `q` to discard.
 
 ### Global calibration
 
 Goal: match the overall color appearance of LEDs to what you see on screen.
 
 ```sh
-caelestia-rgb-sync calibrate global
+caelestia-rgb-sync calibrate global           # smooth mode (default)
+caelestia-rgb-sync calibrate global --steps   # fixed color steps
 ```
 
-The TUI shows truecolor terminal swatches (red, green, blue, white, and midtone variants). Adjust `brightness`, `color_temperature`, `gain`, and `gamma` until the LEDs match the on-screen swatches.
+**Smooth mode** (default) — scrub across the color wheel while tuning parameters. Also lets you add and edit hue corrections to fix specific problem colors (e.g. yellow is too orange on your LEDs).
+
+**Steps mode** (`--steps`) — cycles through fixed reference colors. Adjust `brightness`, `color_temperature`, `gain`, `gamma`, and `saturation` until the LEDs match the on-screen color swatches.
 
 Controls:
-- `j/k` or `Up/Down` - select parameter
+- `Up/Down` - select parameter
 - `+` / `-` - increase / decrease value
+- `w` / `s` - increase / decrease preview brightness
+- `a` / `d` - scrub hue (smooth mode only)
+- `n` - add a new hue correction at the current hue (smooth mode only)
+- `x` - delete the selected hue correction (smooth mode only)
 - `Enter` - save
 - `q` - cancel
 
-After saving, a rainbow sweep runs for final verification.
+After saving in steps mode, a rainbow sweep runs for final verification.
+
+### Calibration order
+
+1. **Per-device first** — normalize all devices so they respond identically to the same input color.
+2. **Global second** — shift the overall tone (warmth, brightness, saturation) to match your screen.
+
+If you do them in the wrong order, global corrections will be fighting per-device imbalances.
 
 ## Troubleshooting
 
@@ -209,17 +237,21 @@ Add `acpi_enforce_resources=lax` to your kernel parameters.
 
 **Device shows wrong color or ignores updates**
 
-- Try `force_mode = true` for the device if it keeps switching modes
-- Try `fast = false` if the color flickers or reverts
-- Check that the `mode` name matches what `openrgb --list-devices` shows
+- Try `force_mode = true` for that device. Some GPU RGB controllers require a mode command before each color update or they silently ignore it. Note that this will cause the device to lag behind others in the calibration preview (updated in a background thread so it does not block the rainbow).
+- Try `fast = false` if the color flickers or reverts immediately after applying.
+- Check that the `mode` value matches what `caelestia-rgb-sync devices` reports.
 
 **Colors apply but look very different from the wallpaper**
 
-Run `caelestia-rgb-sync calibrate device` first, then `calibrate global`. Per-device normalization must come before global tuning.
+Run `caelestia-rgb-sync calibrate device` first, then `calibrate global`. Per-device normalization must come before global tuning or the results will be wrong.
+
+**RAM sticks show different colors**
+
+If two sticks have the same name in OpenRGB, run `calibrate device` — the TUI will split them into `#0` and `#1` entries automatically so you can tune them independently.
 
 ## Using with a different shell
 
-The daemon reads a hex color variable from a text file. Edit `SCHEME_PATH` and `color_source` in the config to point to your shell's equivalent.
+The daemon reads a hex color variable from a text file. Edit `SCHEME_PATH` in the script and `color_source` in the config to point to your shell's equivalent file and variable name.
 
 ## License
 
