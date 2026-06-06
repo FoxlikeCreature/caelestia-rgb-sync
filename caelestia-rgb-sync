@@ -651,7 +651,7 @@ def cmd_calibrate_device(args) -> int:
         print("No config found. Run 'caelestia-rgb-sync init' first.", file=sys.stderr)
         return 1
 
-    smooth = getattr(args, "smooth", False)
+    smooth = not getattr(args, "steps", False)
 
     try:
         client = connect(retries=3, delay=1.0)
@@ -1045,7 +1045,7 @@ def _draw_color_block(stdscr, start_row: int, W: int,
 
 
 def cmd_calibrate_global(args) -> int:
-    smooth = getattr(args, "smooth", False)
+    smooth = not getattr(args, "steps", False)
     cfg = load_config()
     if not cfg:
         print("No config found. Run 'caelestia-rgb-sync init' first.", file=sys.stderr)
@@ -1473,11 +1473,11 @@ def main() -> int:
     cal_sub = cal.add_subparsers(dest="cal_target", metavar="target")
     cal_sub.required = True
     cal_dev = cal_sub.add_parser("device", help="Per-device normalization (curses TUI)")
-    cal_dev.add_argument("--smooth", action="store_true",
-                         help="Free hue scrub with a/d instead of fixed color steps")
+    cal_dev.add_argument("--steps", action="store_true",
+                         help="Fixed color steps instead of free hue scrub")
     cal_global = cal_sub.add_parser("global", help="Global brightness/temperature/gain/gamma (curses TUI)")
-    cal_global.add_argument("--smooth", action="store_true",
-                            help="Free hue scrub with a/d instead of fixed color steps")
+    cal_global.add_argument("--steps", action="store_true",
+                            help="Fixed color steps instead of free hue scrub")
 
     args = parser.parse_args()
 
