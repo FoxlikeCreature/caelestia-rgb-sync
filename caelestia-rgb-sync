@@ -195,6 +195,12 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
         except Exception as e:
             print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
     device.set_color(color, fast=fast)
+    skip_zones = dc.get("skip_zones", [])
+    if skip_zones:
+        black = RGBColor(0, 0, 0)
+        for zone in device.zones:
+            if zone.name in skip_zones:
+                zone.set_color(black, fast=fast)
 
 
 def apply_all(client: OpenRGBClient, cfg: dict) -> None:
