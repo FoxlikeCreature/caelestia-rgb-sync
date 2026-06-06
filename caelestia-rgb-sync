@@ -223,12 +223,15 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
 
 def restore_wallpaper(client: OpenRGBClient, cfg: dict) -> None:
     """Restore wallpaper accent color, then also signal the daemon as a backup."""
+    time.sleep(0.1)  # let openrgb settle after rapid live-preview updates
     try:
         apply_all(client, cfg)
     except Exception as e:
         print(f"warning: restore apply failed ({e})", file=sys.stderr, flush=True)
     try:
-        SCHEME_PATH.touch()
+        # write_text generates IN_CLOSE_WRITE; Path.touch() only generates IN_ATTRIB
+        # which the daemon watcher does not listen to
+        SCHEME_PATH.write_text(SCHEME_PATH.read_text())
     except Exception:
         pass
 
