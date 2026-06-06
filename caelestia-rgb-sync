@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-caelestia-rgb-daemon — sync RGB lighting to the caelestia theme accent color.
+caelestia-rgb-sync — sync RGB lighting to the caelestia theme accent color.
 
-Runs as a persistent daemon: holds one OpenRGB connection, watches the scheme
-file for changes via inotify, and applies colors instantly.
-
-Config: ~/.config/caelestia-rgb/config.toml
+Commands:
+  daemon              watch scheme file, apply on change (for systemd)
+  apply               apply current color once and exit
+  devices             list OpenRGB devices
+  init                detect devices, write initial config
+  calibrate device    per-device gain/gamma/black_point calibration (curses TUI)
+  calibrate global    global brightness/temperature/gain/gamma calibration (curses TUI)
+  enable              enable systemd service
+  disable             disable systemd service
 """
 
+import argparse
 import colorsys
+import curses
+import math
 import re
+import select
 import subprocess
 import sys
+import threading
 import time
 import tomllib
+import tomli_w
 from pathlib import Path
 
 from openrgb import OpenRGBClient
@@ -21,6 +32,13 @@ from openrgb.utils import RGBColor
 
 CONFIG_PATH = Path.home() / ".config/caelestia-rgb/config.toml"
 SCHEME_PATH = Path.home() / ".local/share/caelestia/hypr/scheme/current.conf"
+STEPS = [0.05, 0.01, 0.001]
+HUE_STEP = 2.0  # degrees per a/d keypress in smooth mode
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -29,64 +47,119 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
-def read_scheme_color(variable: str) -> str:
-    pattern = re.compile(rf"^\${re.escape(variable)}\s*=\s*([0-9a-fA-F]{{6}})", re.M)
-    text = SCHEME_PATH.read_text()
-    m = pattern.search(text)
-    if not m:
-        raise ValueError(f"Variable ${variable} not found in {SCHEME_PATH}")
-    return m.group(1)
+def save_config(cfg: dict) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "wb") as f:
+        tomli_w.dump(cfg, f)
 
 
-def _ch(params: dict, key: str) -> dict:
-    return params.get(key, {})
+# ---------------------------------------------------------------------------
+# Color math
+# ---------------------------------------------------------------------------
+
+def hex_to_rgb(h: str) -> tuple[float, float, float]:
+    return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
 
 
-def _apply_channel(v: float, ch: dict) -> float:
-    v = v * ch.get("scale", 1.0)
-    return min(max(v, ch.get("floor", 0.0)), ch.get("ceil", 1.0))
+def clamp(v: float) -> float:
+    return max(0.0, min(1.0, v))
 
 
-def apply_correction(r: float, g: float, b: float, params: dict) -> tuple[float, float, float]:
-    h, s, v = colorsys.rgb_to_hsv(r, g, b)
-    h = _apply_channel(h, _ch(params, "h"))
-    s = _apply_channel(s, _ch(params, "s"))
-    v = _apply_channel(v, _ch(params, "v"))
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    r = _apply_channel(r, _ch(params, "r"))
-    g = _apply_channel(g, _ch(params, "g"))
-    b = _apply_channel(b, _ch(params, "b"))
+def _kelvin_raw(kelvin: float) -> tuple[float, float, float]:
+    """Tanner Helland approximation: raw RGB for a given color temperature."""
+    t = kelvin / 100.0
+    r = 1.0 if t <= 66 else clamp(329.698727446 * ((t - 60) ** -0.1332047592) / 255)
+    if t <= 66:
+        g = 0.0 if t <= 1 else clamp((99.4708025861 * math.log(t) - 161.1195681661) / 255)
+    else:
+        g = clamp(288.1221695283 * ((t - 60) ** -0.0755148492) / 255)
+    if t >= 66:
+        b = 1.0
+    elif t <= 19:
+        b = 0.0
+    else:
+        b = clamp((138.5177312231 * math.log(t - 10) - 305.0447927307) / 255)
     return r, g, b
 
 
-def hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
-    return (
-        int(hex_color[0:2], 16) / 255,
-        int(hex_color[2:4], 16) / 255,
-        int(hex_color[4:6], 16) / 255,
-    )
+def kelvin_multipliers(kelvin: float) -> tuple[float, float, float]:
+    """Per-channel multipliers normalized so 6500 K = (1, 1, 1)."""
+    r, g, b = _kelvin_raw(kelvin)
+    br, bg, bb = _kelvin_raw(6500)
+    return (r / br if br else r, g / bg if bg else g, b / bb if bb else b)
 
 
-def find_hue_range_cfg(hue: float, ranges: list[dict]) -> dict:
-    for r in ranges:
-        lo = r.get("from", 0.0)
-        hi = r.get("to", 1.0)
-        if lo <= hi:
-            if lo <= hue <= hi:
-                return r
-        else:  # wrap-around through 0 (e.g. red: from=0.95 to=0.05)
-            if hue >= lo or hue <= hi:
-                return r
-    return {}
+def device_correction(r: float, g: float, b: float, dc: dict) -> tuple[float, float, float]:
+    """Per-device: gain → gamma → black_point."""
+    gain = dc.get("gain", [1.0, 1.0, 1.0])
+    gamma = dc.get("gamma", [1.0, 1.0, 1.0])
+    bp = dc.get("black_point", [0.0, 0.0, 0.0])
+    out = []
+    for i, v in enumerate((r, g, b)):
+        v = clamp(v * gain[i])
+        v = v ** gamma[i] if v > 0 else 0.0
+        out.append(max(clamp(v), bp[i]))
+    return tuple(out)
 
 
-def find_device_cfg(name: str, overrides: list[dict]) -> dict:
+def global_correction(r: float, g: float, b: float, gc: dict) -> tuple[float, float, float]:
+    """Apply global pipeline: gain*brightness → gamma → color_temp → hue_corrections."""
+    gain = gc.get("gain", [1.0, 1.0, 1.0])
+    brightness = gc.get("brightness", 1.0)
+    gamma = gc.get("gamma", 1.0)
+    kelvin = gc.get("color_temperature", 6500)
+
+    r = clamp(r * gain[0] * brightness)
+    g = clamp(g * gain[1] * brightness)
+    b = clamp(b * gain[2] * brightness)
+
+    r = r ** gamma if r > 0 else 0.0
+    g = g ** gamma if g > 0 else 0.0
+    b = b ** gamma if b > 0 else 0.0
+
+    kr, kg, kb = kelvin_multipliers(kelvin)
+    r, g, b = clamp(r * kr), clamp(g * kg), clamp(b * kb)
+
+    h, s, _ = colorsys.rgb_to_hsv(r, g, b)
+    for hc in gc.get("hue_corrections", []):
+        hc_gain = hc.get("gain", [1.0, 1.0, 1.0])
+        if "saturation_max" in hc:
+            if s > hc["saturation_max"]:
+                continue
+        else:
+            center = hc.get("hue_center", 0.0)
+            width = hc.get("hue_width", 0.1)
+            dist = min(abs(h - center), 1.0 - abs(h - center))
+            if dist > width / 2:
+                continue
+            weight = 1.0 - dist / (width / 2)
+            hc_gain = [1.0 + weight * (g_ - 1.0) for g_ in hc_gain]
+        r = clamp(r * hc_gain[0])
+        g = clamp(g * hc_gain[1])
+        b = clamp(b * hc_gain[2])
+
+    return r, g, b
+
+
+def find_device_cfg(name: str, devices_cfg: dict) -> dict:
     name_lower = name.lower()
-    for override in overrides:
-        if override.get("match", "").lower() in name_lower:
-            return override
+    for key, val in devices_cfg.items():
+        if key.lower() in name_lower:
+            return val
     return {}
 
+
+def read_scheme_color(variable: str) -> str:
+    pattern = re.compile(rf"^\${re.escape(variable)}\s*=\s*([0-9a-fA-F]{{6}})", re.M)
+    m = pattern.search(SCHEME_PATH.read_text())
+    if not m:
+        raise ValueError(f"${variable} not found in {SCHEME_PATH}")
+    return m.group(1)
+
+
+# ---------------------------------------------------------------------------
+# OpenRGB helpers
+# ---------------------------------------------------------------------------
 
 def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
     for attempt in range(retries):
@@ -94,64 +167,279 @@ def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
             return OpenRGBClient()
         except Exception:
             if attempt < retries - 1:
-                print(f"OpenRGB server not ready, retrying... ({attempt+1}/{retries})", flush=True)
+                print(f"OpenRGB not ready, retrying... ({attempt+1}/{retries})", flush=True)
                 time.sleep(delay)
-    raise RuntimeError("Could not connect to OpenRGB server after retries")
+    raise RuntimeError("Could not connect to OpenRGB server")
+
+
+def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
+    mode_name = dc.get("mode", gc.get("mode", "direct"))
+    force = dc.get("force_mode", gc.get("force_mode", False))
+    fast = dc.get("fast", gc.get("fast", True))
+    cur = device.modes[device.active_mode].name if device.modes else ""
+    if force or cur.lower() != mode_name.lower():
+        try:
+            device.set_mode(mode_name)
+        except Exception as e:
+            print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
+    device.set_color(color, fast=fast)
 
 
 def apply_all(client: OpenRGBClient, cfg: dict) -> None:
-    source    = cfg.get("color_source", "primaryPaletteKeyColor")
-    global_p  = cfg.get("global", {})
-    hue_ranges = cfg.get("hue_ranges", [])
-    overrides = cfg.get("devices", [])
+    source = cfg.get("color_source", "primaryPaletteKeyColor")
+    gc = cfg.get("global", {})
+    devices_cfg = cfg.get("devices", {})
 
     base_hex = read_scheme_color(source)
-    base_rgb = hex_to_rgb(base_hex)
-    base_hue = colorsys.rgb_to_hsv(*base_rgb)[0]
-
-    hue_cfg = find_hue_range_cfg(base_hue, hue_ranges)
-    hue_label = f" [{hue_cfg.get('name', '')}]" if hue_cfg else ""
-    print(f"source color: #{base_hex}  (${source}){hue_label}", flush=True)
+    r, g, b = hex_to_rgb(base_hex)
+    print(f"source: #{base_hex}  (${source})", flush=True)
 
     for device in client.devices:
-        dev_cfg   = find_device_cfg(device.name, overrides)
-        if dev_cfg.get("skip"):
+        dc = find_device_cfg(device.name, devices_cfg)
+        if dc.get("skip"):
             continue
-
-        mode_name   = dev_cfg.get("mode",        global_p.get("mode",        "direct"))
-        force_mode  = dev_cfg.get("force_mode",  global_p.get("force_mode",  False))
-        fast        = dev_cfg.get("fast",        global_p.get("fast",        True))
-
-        # Three-pass correction: global -> hue_range -> per-device.
-        r, g, b = apply_correction(*base_rgb, global_p)
-        r, g, b = apply_correction(r, g, b, hue_cfg)
-        r, g, b = apply_correction(r, g, b, dev_cfg)
-        color = RGBColor(int(r * 255), int(g * 255), int(b * 255))
-
-        current_mode = device.modes[device.active_mode].name if device.modes else ""
-        if force_mode or current_mode.lower() != mode_name.lower():
-            device.set_mode(mode_name)
-
-        device.set_color(color, fast=fast)
-        print(f"  {device.name:45s} mode={mode_name:8s} color=#{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
+        dr, dg, db = device_correction(r, g, b, dc)
+        fr, fg, fb = global_correction(dr, dg, db, gc)
+        color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
+        set_device_color(device, color, dc, gc)
+        print(f"  {device.name:45s} #{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
 
 
-def watch_scheme() -> subprocess.Popen:
-    return subprocess.Popen(
-        [
-            "inotifywait", "-m", "-e", "close_write,moved_to,create",
-            "--format", "%f",
-            str(SCHEME_PATH.parent),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+def restore_wallpaper(client: OpenRGBClient, cfg: dict) -> None:
+    """Restore wallpaper accent color. Falls back to touching scheme file to trigger the daemon."""
+    try:
+        apply_all(client, cfg)
+        return
+    except Exception as e:
+        print(f"warning: restore failed ({e}), signalling daemon...", flush=True)
+    try:
+        SCHEME_PATH.touch()
+    except Exception:
+        pass
 
 
-def main() -> int:
+def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = None) -> str:
+    """
+    Looping rainbow sweep inside curses.
+    Returns: 's' = save, 'q' = cancel, 'r' = go back to calibration.
+    Keys: Enter/s = save, r = back to calibration, q = cancel.
+    """
+    gc = cfg.get("global", {})
+    dev_cfgs = dev_override if dev_override is not None else cfg.get("devices", {})
+    TOTAL = 80
+    result = ["q"]
+
+    def _apply_hue(hue: float) -> None:
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        for device in client.devices:
+            dc = find_device_cfg(device.name, dev_cfgs)
+            if dc.get("skip"):
+                continue
+            dr, dg, db = device_correction(r, g, b, dc)
+            fr, fg, fb = global_correction(dr, dg, db, gc)
+            color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
+            try:
+                set_device_color(device, color, dc, gc)
+            except Exception:
+                pass
+
+    def run(stdscr) -> None:
+        curses.curs_set(0)
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        curses.start_color()
+        curses.use_default_colors()
+        step = 0
+        COLOR_IDX = 51
+        PAIR_IDX  = 51
+
+        while True:
+            hue = step / TOTAL
+            _apply_hue(hue)
+            step = (step + 1) % TOTAL
+
+            try:
+                h, w = stdscr.getmaxyx()
+                r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                if curses.can_change_color() and COLOR_IDX < curses.COLORS:
+                    curses.init_color(COLOR_IDX, int(r * 1000), int(g * 1000), int(b * 1000))
+                    curses.init_pair(PAIR_IDX, COLOR_IDX, COLOR_IDX)
+                    fill = curses.color_pair(PAIR_IDX)
+                    for row in range(h - 2):
+                        stdscr.addstr(row, 0, " " * w, fill)
+                hint = " Enter/s: save   r: back to calibration   q: cancel "
+                stdscr.addstr(h - 1, max(0, (w - len(hint)) // 2),
+                              hint[:w], curses.A_REVERSE)
+                stdscr.refresh()
+            except curses.error:
+                pass
+
+            key = stdscr.getch()
+            if key == ord('q'):
+                result[0] = "q"
+                return
+            elif key == ord('r'):
+                result[0] = "r"
+                return
+            elif key in (10, 13, ord('s'), curses.KEY_ENTER):
+                result[0] = "s"
+                return
+
+            time.sleep(0.025)
+
+    curses.wrapper(run)
+    return result[0]
+
+
+# ---------------------------------------------------------------------------
+# Live preview (background thread — non-blocking apply during calibration)
+# ---------------------------------------------------------------------------
+
+class LivePreview:
+    """
+    Applies a color to all devices in a background thread.
+    The TUI posts requests; the thread always applies the latest one.
+    Uses fast=True for responsiveness; set_mode is skipped if already correct.
+    """
+
+    def __init__(self, client: OpenRGBClient) -> None:
+        self._client = client
+        self._lock = threading.Lock()
+        self._r = self._g = self._b = 0.0
+        self._dev_state: dict = {}
+        self._gc: dict = {}
+        self._dirty = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def request(self, r: float, g: float, b: float,
+                dev_state: dict, gc: dict = {}) -> None:
+        with self._lock:
+            self._r, self._g, self._b = r, g, b
+            self._dev_state = dev_state
+            self._gc = gc
+        self._dirty.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._dirty.set()
+        self._thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._dirty.wait(timeout=0.1)
+            self._dirty.clear()
+            if self._stop.is_set():
+                break
+            with self._lock:
+                r, g, b = self._r, self._g, self._b
+                dev_state = self._dev_state
+                gc = self._gc
+            for device in self._client.devices:
+                dc = dev_state.get(device.name, {})
+                if dc.get("skip"):
+                    continue
+                try:
+                    dr, dg, db = device_correction(r, g, b, dc)
+                    if gc:
+                        dr, dg, db = global_correction(dr, dg, db, gc)
+                    color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
+                    mode = dc.get("mode", "direct")
+                    cur = device.modes[device.active_mode].name if device.modes else ""
+                    if cur.lower() != mode.lower():
+                        try:
+                            device.set_mode(mode)
+                        except Exception:
+                            pass
+                    device.set_color(color, fast=True)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Commands: basic
+# ---------------------------------------------------------------------------
+
+def cmd_devices(_args) -> int:
+    try:
+        client = connect(retries=3, delay=1.0)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    for d in client.devices:
+        mode = d.modes[d.active_mode].name if d.modes else "?"
+        print(f"  {d.name}  (mode: {mode})")
+    client.disconnect()
+    return 0
+
+
+def cmd_init(_args) -> int:
+    try:
+        client = connect(retries=3, delay=1.0)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    if CONFIG_PATH.exists():
+        print(f"Config already exists at {CONFIG_PATH}. Remove it first to reinitialize.")
+        client.disconnect()
+        return 1
+
+    cfg: dict = {
+        "color_source": "primaryPaletteKeyColor",
+        "devices": {},
+        "global": {
+            "brightness": 1.0,
+            "color_temperature": 6500,
+            "gain": [1.0, 1.0, 1.0],
+            "gamma": 1.0,
+            "hue_corrections": [],
+        },
+    }
+
+    for d in client.devices:
+        cfg["devices"][d.name] = {
+            "gain": [1.0, 1.0, 1.0],
+            "gamma": [1.0, 1.0, 1.0],
+            "black_point": [0.0, 0.0, 0.0],
+            "mode": "direct",
+        }
+        print(f"  found: {d.name}")
+
+    client.disconnect()
+    save_config(cfg)
+    print(f"\nConfig written to {CONFIG_PATH}")
+    print("Run 'caelestia-rgb-sync calibrate device' to normalize device colors.")
+    return 0
+
+
+def cmd_apply(_args) -> int:
     cfg = load_config()
+    try:
+        client = connect()
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    try:
+        apply_all(client, cfg)
+    finally:
+        client.disconnect()
+    return 0
 
+
+def cmd_enable(_args) -> int:
+    subprocess.run(["systemctl", "--user", "enable", "--now", "caelestia-rgb.service"])
+    return 0
+
+
+def cmd_disable(_args) -> int:
+    subprocess.run(["systemctl", "--user", "disable", "--now", "caelestia-rgb.service"])
+    return 0
+
+
+def cmd_daemon(_args) -> int:
+    cfg = load_config()
     print("Connecting to OpenRGB...", flush=True)
     try:
         client = connect()
@@ -160,23 +448,27 @@ def main() -> int:
         return 1
 
     print(f"Connected. {len(client.devices)} devices.", flush=True)
-
     try:
         apply_all(client, cfg)
     except Exception as e:
         print(f"warning: initial apply failed: {e}", file=sys.stderr)
 
-    print(f"Watching {SCHEME_PATH} for changes...", flush=True)
-    watcher = watch_scheme()
-    target  = SCHEME_PATH.name
+    print(f"Watching {SCHEME_PATH} ...", flush=True)
+    watcher = subprocess.Popen(
+        ["inotifywait", "-m", "-e", "close_write,moved_to,create",
+         "--format", "%f", str(SCHEME_PATH.parent)],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    target = SCHEME_PATH.name
 
     try:
         for line in watcher.stdout:
             if line.strip() != target:
                 continue
-
+            time.sleep(0.15)
+            while select.select([watcher.stdout], [], [], 0)[0]:
+                watcher.stdout.readline()
             cfg = load_config()
-
             try:
                 apply_all(client, cfg)
             except Exception as e:
@@ -196,7 +488,660 @@ def main() -> int:
             client.disconnect()
         except Exception:
             pass
+    return 0
 
+
+# ---------------------------------------------------------------------------
+# Calibrate: device (curses TUI)
+# ---------------------------------------------------------------------------
+# Controls: w/s or Up/Down = move between devices
+#           a/d or Left/Right = move between fields (gain/gamma/black_point)
+#           +/- = increase/decrease value
+#           Tab = cycle step size (0.05 / 0.01 / 0.001)
+#           Enter = next step
+#           q = cancel
+
+DEVICE_FIELDS = ["gain", "gamma", "black_point"]
+CH_LABELS = ["R", "G", "B"]
+
+CAL_STEPS = [
+    ("RED",     1.0, 0.0, 0.0),
+    ("GREEN",   0.0, 1.0, 0.0),
+    ("BLUE",    0.0, 0.0, 1.0),
+    ("YELLOW",  1.0, 1.0, 0.0),
+    ("CYAN",    0.0, 1.0, 1.0),
+    ("MAGENTA", 1.0, 0.0, 1.0),
+]
+
+
+def _draw_device_row(stdscr, row: int, W: int, row_str: str) -> None:
+    """Draw one row with \\x01...\\x02 segments highlighted (reverse+bold)."""
+    try:
+        stdscr.addstr(row, 0, "| ")
+    except curses.error:
+        return
+    col = 2
+    in_hl = False
+    for ch in row_str:
+        if ch == "\x01":
+            in_hl = True
+            continue
+        if ch == "\x02":
+            in_hl = False
+            continue
+        if col >= W - 1:
+            break
+        attr = curses.A_REVERSE | curses.A_BOLD if in_hl else curses.A_NORMAL
+        try:
+            stdscr.addch(row, col, ch, attr)
+        except curses.error:
+            pass
+        col += 1
+    while col < W - 1:
+        try:
+            stdscr.addch(row, col, " ")
+        except curses.error:
+            pass
+        col += 1
+    try:
+        stdscr.addch(row, W - 1, "|")
+    except curses.error:
+        pass
+
+
+def cmd_calibrate_device(args) -> int:
+    cfg = load_config()
+    if not cfg:
+        print("No config found. Run 'caelestia-rgb-sync init' first.", file=sys.stderr)
+        return 1
+
+    smooth = getattr(args, "smooth", False)
+
+    try:
+        client = connect(retries=3, delay=1.0)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    dev_state: dict[str, dict] = {}
+    active_names = []
+    for d in client.devices:
+        orig = find_device_cfg(d.name, cfg.get("devices", {}))
+        if orig.get("skip"):
+            continue
+        dev_state[d.name] = {
+            "gain":        list(orig.get("gain",        [1.0, 1.0, 1.0])),
+            "gamma":       list(orig.get("gamma",       [1.0, 1.0, 1.0])),
+            "black_point": list(orig.get("black_point", [0.0, 0.0, 0.0])),
+            "mode":        orig.get("mode", "direct"),
+            "force_mode":  orig.get("force_mode", False),
+            "fast":        orig.get("fast", True),
+        }
+        active_names.append(d.name)
+
+    if not active_names:
+        print("No active devices found.", file=sys.stderr)
+        client.disconnect()
+        return 1
+
+    # Flat (device, channel) list for Up/Down navigation
+    rows = [(name, ch) for name in active_names for ch in range(3)]
+
+    def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
+                    hint1: str, hint2: str, header: str) -> None:
+        """Shared table body used by both draw modes."""
+        stdscr.erase()
+        W = stdscr.getmaxyx()[1]
+
+        def line(r: int, text: str) -> None:
+            try:
+                stdscr.addstr(r, 0, ("| " + text).ljust(W - 1) + "|")
+            except curses.error:
+                pass
+
+        try:
+            stdscr.addstr(0, 0, ("+" + f" {header} ").ljust(W - 1, "-") + "+")
+        except curses.error:
+            pass
+        line(1, hint1)
+        line(2, "")
+        line(3, f"  {'Device':<32} ch   {'gain':>7}   {'gamma':>7}   {'blk_pt':>7}")
+        line(4, f"  {'':32}        {'-------':>7}   {'-------':>7}   {'-------':>7}")
+
+        display_row = 5
+        for ri, (name, ch) in enumerate(rows):
+            dc = dev_state[name]
+            is_sel = ri == row_idx
+            ch_marker = ">" if is_sel else " "
+            dev_display = name[:32] if ch == 0 else ""
+            vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
+
+            row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
+            for fi, v in enumerate(vals):
+                cell = f"{v:8.3f}   "
+                row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
+
+            _draw_device_row(stdscr, display_row, W, row_str)
+            display_row += 1
+
+            if ch == 2:
+                line(display_row, "")
+                display_row += 1
+
+        line(display_row,     f"Up/Dn: channel   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})")
+        line(display_row + 1, hint2)
+        try:
+            stdscr.addstr(display_row + 2, 0, ("+" + "-" * (W - 2) + "+")[:W])
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    def draw_step(stdscr, step_idx: int, row_idx: int, field_idx: int, step_size_idx: int) -> None:
+        label, _sr, _sg, _sb = CAL_STEPS[step_idx]
+        total = len(CAL_STEPS)
+        _draw_table(
+            stdscr, row_idx, field_idx, STEPS[step_size_idx],
+            hint1=f"All devices: {label}. Adjust R/G/B per device to match brightness and hue.",
+            hint2="Enter: next color   q: cancel",
+            header=f"Device calibration - {label} ({step_idx+1}/{total})",
+        )
+
+    def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int) -> None:
+        _draw_table(
+            stdscr, row_idx, field_idx, STEPS[step_size_idx],
+            hint1=f"a/d: hue ({hue*360:.0f} deg)   scrub across the color wheel to find problem hues.",
+            hint2="Enter: save   q: cancel",
+            header="Device calibration - smooth",
+        )
+
+    result: dict | None = None
+
+    def run_tui(stdscr) -> bool:
+        nonlocal result
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        row_idx = field_idx = step_size_idx = 0
+
+        preview = LivePreview(client)
+
+        preview_brightness = 1.0
+
+        if smooth:
+            hue = 0.0
+            sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+
+            while True:
+                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx)
+                key = stdscr.getch()
+                step_size = STEPS[step_size_idx]
+                name, ch = rows[row_idx]
+                dc = dev_state[name]
+
+                if key == ord('q'):
+                    preview.stop()
+                    return False
+                elif key in (10, 13, curses.KEY_ENTER):
+                    preview.stop()
+                    result = dev_state
+                    return True
+                elif key == curses.KEY_DOWN:
+                    row_idx = (row_idx + 1) % len(rows)
+                elif key == curses.KEY_UP:
+                    row_idx = (row_idx - 1) % len(rows)
+                elif key == curses.KEY_RIGHT:
+                    field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
+                elif key == curses.KEY_LEFT:
+                    field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
+                elif key == ord('\t'):
+                    step_size_idx = (step_size_idx + 1) % len(STEPS)
+                elif key == ord('w'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key == ord('s'):
+                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key == ord('a'):
+                    hue = (hue - HUE_STEP / 360.0) % 1.0
+                    sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key == ord('d'):
+                    hue = (hue + HUE_STEP / 360.0) % 1.0
+                    sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key in (ord('='), ord('+')):
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key in (ord('-'), ord('_')):
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+
+        else:
+            step_idx = 0
+            label, sr, sg, sb = CAL_STEPS[step_idx]
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+
+            while step_idx < len(CAL_STEPS):
+                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx)
+                key = stdscr.getch()
+                step_size = STEPS[step_size_idx]
+                name, ch = rows[row_idx]
+                dc = dev_state[name]
+
+                if key == ord('q'):
+                    preview.stop()
+                    return False
+                elif key == curses.KEY_DOWN:
+                    row_idx = (row_idx + 1) % len(rows)
+                elif key == curses.KEY_UP:
+                    row_idx = (row_idx - 1) % len(rows)
+                elif key in (curses.KEY_RIGHT, ord('d')):
+                    field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
+                elif key in (curses.KEY_LEFT, ord('a')):
+                    field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
+                elif key == ord('w'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key == ord('s'):
+                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key == ord('\t'):
+                    step_size_idx = (step_size_idx + 1) % len(STEPS)
+                elif key in (ord('='), ord('+')):
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key in (ord('-'), ord('_')):
+                    dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                elif key in (10, 13, curses.KEY_ENTER):
+                    step_idx += 1
+                    if step_idx < len(CAL_STEPS):
+                        label, sr, sg, sb = CAL_STEPS[step_idx]
+                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness, dev_state)
+                        row_idx = field_idx = 0
+
+            preview.stop()
+            result = dev_state
+            return True
+
+    while True:
+        confirmed = curses.wrapper(run_tui)
+        if not confirmed:
+            print("Calibration cancelled.")
+            restore_wallpaper(client, cfg)
+            client.disconnect()
+            return 0
+        if smooth:
+            # smooth mode already served as the rainbow check — skip sweep
+            break
+        action = verify_sweep(client, cfg, dev_override=result)
+        if action == "s":
+            break
+        elif action == "q":
+            print("Discarded.")
+            restore_wallpaper(client, cfg)
+            client.disconnect()
+            return 0
+        # action == "r": loop back to TUI
+
+    new_cfg = load_config()
+    if "devices" not in new_cfg:
+        new_cfg["devices"] = {}
+    for name, dc in result.items():
+        key = next((k for k in new_cfg["devices"] if k.lower() in name.lower()), name)
+        if key not in new_cfg["devices"]:
+            new_cfg["devices"][key] = {}
+        new_cfg["devices"][key]["gain"]        = dc["gain"]
+        new_cfg["devices"][key]["gamma"]       = dc["gamma"]
+        new_cfg["devices"][key]["black_point"] = dc["black_point"]
+
+    save_config(new_cfg)
+    restore_wallpaper(client, load_config())
+    print(f"Saved to {CONFIG_PATH}")
+    client.disconnect()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Calibrate: global (curses TUI)
+# ---------------------------------------------------------------------------
+# Controls: j/k or Up/Down = move between parameters
+#           + / = = increase value   - / _ = decrease
+#           Tab = cycle step
+#           Enter = save and exit
+#           q = cancel without saving
+
+GLOBAL_PARAMS = [
+    # (state_key,         label,               step,  lo,    hi)
+    ("brightness",        "brightness",         0.01,  0.1,   2.0),
+    ("color_temperature", "color_temp (K)",    50.0,  1000., 12000.),
+    ("gain_r",            "gain R",             0.01,  0.0,   4.0),
+    ("gain_g",            "gain G",             0.01,  0.0,   4.0),
+    ("gain_b",            "gain B",             0.01,  0.0,   4.0),
+    ("gamma",             "gamma",              0.01,  0.1,   4.0),
+]
+
+def _state_to_gcfg(state: dict, base_hue_corrections: list) -> dict:
+    return {
+        "brightness": state["brightness"],
+        "color_temperature": state["color_temperature"],
+        "gain": [state["gain_r"], state["gain_g"], state["gain_b"]],
+        "gamma": state["gamma"],
+        "hue_corrections": base_hue_corrections,
+    }
+
+
+BLOCK_ROWS = 4  # height of the reference color block
+
+
+def _draw_color_block(stdscr, start_row: int, W: int,
+                      r: float, g: float, b: float) -> None:
+    """Fill BLOCK_ROWS rows with a solid color using curses truecolor."""
+    COLOR_IDX = 50
+    PAIR_IDX  = 50
+    if curses.can_change_color() and COLOR_IDX < curses.COLORS:
+        curses.init_color(COLOR_IDX, int(r * 1000), int(g * 1000), int(b * 1000))
+        curses.init_pair(PAIR_IDX, COLOR_IDX, COLOR_IDX)
+        for row in range(start_row, start_row + BLOCK_ROWS):
+            try:
+                stdscr.addstr(row, 0, "|")
+                stdscr.addstr(row, 1, " " * (W - 2), curses.color_pair(PAIR_IDX))
+                stdscr.addstr(row, W - 1, "|")
+            except curses.error:
+                pass
+    else:
+        r8, g8, b8 = int(r * 255), int(g * 255), int(b * 255)
+        for row in range(start_row, start_row + BLOCK_ROWS):
+            try:
+                stdscr.addstr(row, 0, f"| RGB({r8},{g8},{b8})".ljust(W - 1) + "|")
+            except curses.error:
+                pass
+
+
+def cmd_calibrate_global(args) -> int:
+    smooth = getattr(args, "smooth", False)
+    cfg = load_config()
+    if not cfg:
+        print("No config found. Run 'caelestia-rgb-sync init' first.", file=sys.stderr)
+        return 1
+
+    try:
+        client = connect(retries=3, delay=1.0)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    gcfg_orig = cfg.get("global", {})
+    hue_corr  = gcfg_orig.get("hue_corrections", [])
+    dev_cfgs  = cfg.get("devices", {})
+
+    state = {
+        "brightness":        gcfg_orig.get("brightness", 1.0),
+        "color_temperature": float(gcfg_orig.get("color_temperature", 6500)),
+        "gain_r":            gcfg_orig.get("gain", [1.0, 1.0, 1.0])[0],
+        "gain_g":            gcfg_orig.get("gain", [1.0, 1.0, 1.0])[1],
+        "gain_b":            gcfg_orig.get("gain", [1.0, 1.0, 1.0])[2],
+        "gamma":             gcfg_orig.get("gamma", 1.0),
+    }
+
+    # Snapshot device corrections for use in LivePreview
+    live_dev_state = {
+        d.name: find_device_cfg(d.name, dev_cfgs)
+        for d in client.devices
+        if not find_device_cfg(d.name, dev_cfgs).get("skip")
+    }
+
+    def draw(stdscr, step_idx: int, param_idx: int, preview_brightness: float,
+             header: str = "", hint2: str = "Enter: next color   q: cancel",
+             override_color: tuple | None = None) -> None:
+        stdscr.erase()
+        W = stdscr.getmaxyx()[1]
+        _, _, step_size, _, _ = GLOBAL_PARAMS[param_idx]
+
+        if override_color is not None:
+            sr, sg, sb = override_color
+            hdr = header
+        else:
+            label, sr, sg, sb = CAL_STEPS[step_idx]
+            hdr = header or f"Global calibration - {label} ({step_idx+1}/{len(CAL_STEPS)})"
+
+        def line(r: int, text: str = "") -> None:
+            try:
+                stdscr.addstr(r, 0, ("| " + text).ljust(W - 1) + "|")
+            except curses.error:
+                pass
+
+        try:
+            stdscr.addstr(0, 0, ("+" + f" {hdr} ").ljust(W - 1, "-") + "+")
+        except curses.error:
+            pass
+        line(1, f"Adjust parameters until LEDs match the color block. w/s: brightness ({preview_brightness:.2f})")
+        line(2, "")
+
+        # Raw reference color block at preview brightness
+        _draw_color_block(stdscr, 3, W,
+                          clamp(sr * preview_brightness),
+                          clamp(sg * preview_brightness),
+                          clamp(sb * preview_brightness))
+
+        line(3 + BLOCK_ROWS, "")
+
+        for i, (key, lbl, _step, _lo, _hi) in enumerate(GLOBAL_PARAMS):
+            v = state[key]
+            val_str = f"{v:.0f} K" if key == "color_temperature" else f"{v:.3f}"
+            text = f"  {'>' if i == param_idx else ' '} {lbl:<22} {val_str}"
+            attr = curses.A_BOLD if i == param_idx else curses.A_NORMAL
+            try:
+                stdscr.addstr(4 + BLOCK_ROWS + i, 0, ("| " + text).ljust(W - 1) + "|", attr)
+            except curses.error:
+                pass
+
+        base = 4 + BLOCK_ROWS + len(GLOBAL_PARAMS)
+        line(base,     "")
+        line(base + 1, f"Up/Dn: param   +/-: value   step: {step_size}")
+        line(base + 2, hint2)
+        try:
+            stdscr.addstr(base + 3, 0, ("+" + "-" * (W - 2) + "+")[:W])
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+    result: dict | None = None
+
+    def run_tui(stdscr) -> bool:
+        nonlocal result
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        curses.start_color()
+        curses.use_default_colors()
+
+        param_idx = 0
+        preview_brightness = 1.0
+        preview = LivePreview(client)
+
+        if smooth:
+            hue = 0.0
+            sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                            live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+
+            while True:
+                draw(stdscr, step_idx=0, param_idx=param_idx,
+                     preview_brightness=preview_brightness,
+                     header=f"Global calibration - smooth - hue: {hue*360:.0f} deg",
+                     hint2="Enter: save   q: cancel",
+                     override_color=(sr, sg, sb))
+                key = stdscr.getch()
+                p_key, _, step_size, lo, hi = GLOBAL_PARAMS[param_idx]
+
+                def send_s() -> None:
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+
+                if key == ord('q'):
+                    preview.stop()
+                    return False
+                elif key in (10, 13, curses.KEY_ENTER):
+                    preview.stop()
+                    result = dict(state)
+                    return True
+                elif key == curses.KEY_DOWN:
+                    param_idx = (param_idx + 1) % len(GLOBAL_PARAMS)
+                elif key == curses.KEY_UP:
+                    param_idx = (param_idx - 1) % len(GLOBAL_PARAMS)
+                elif key == ord('w'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    send_s()
+                elif key == ord('s'):
+                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
+                    send_s()
+                elif key == ord('a'):
+                    hue = (hue - HUE_STEP / 360.0) % 1.0
+                    sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    send_s()
+                elif key == ord('d'):
+                    hue = (hue + HUE_STEP / 360.0) % 1.0
+                    sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+                    send_s()
+                elif key in (ord('='), ord('+')):
+                    state[p_key] = min(hi, round(state[p_key] + step_size, 4))
+                    send_s()
+                elif key in (ord('-'), ord('_')):
+                    state[p_key] = max(lo, round(state[p_key] - step_size, 4))
+                    send_s()
+
+        else:
+            step_idx = 0
+            label, sr, sg, sb = CAL_STEPS[step_idx]
+            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                            live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+
+            while step_idx < len(CAL_STEPS):
+                label, sr, sg, sb = CAL_STEPS[step_idx]
+                draw(stdscr, step_idx=step_idx, param_idx=param_idx,
+                     preview_brightness=preview_brightness)
+                key = stdscr.getch()
+                label, sr, sg, sb = CAL_STEPS[step_idx]
+                p_key, _, step_size, lo, hi = GLOBAL_PARAMS[param_idx]
+
+                def send_n() -> None:
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    live_dev_state, gc=_state_to_gcfg(state, hue_corr))
+
+                if key == ord('q'):
+                    preview.stop()
+                    return False
+                elif key in (10, 13, curses.KEY_ENTER):
+                    step_idx += 1
+                    if step_idx < len(CAL_STEPS):
+                        label, sr, sg, sb = CAL_STEPS[step_idx]
+                        send_n()
+                        param_idx = 0
+                elif key == curses.KEY_DOWN:
+                    param_idx = (param_idx + 1) % len(GLOBAL_PARAMS)
+                elif key == curses.KEY_UP:
+                    param_idx = (param_idx - 1) % len(GLOBAL_PARAMS)
+                elif key == ord('w'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    send_n()
+                elif key == ord('s'):
+                    preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
+                    send_n()
+                elif key in (ord('='), ord('+')):
+                    state[p_key] = min(hi, round(state[p_key] + step_size, 4))
+                    send_n()
+                elif key in (ord('-'), ord('_')):
+                    state[p_key] = max(lo, round(state[p_key] - step_size, 4))
+                    send_n()
+
+            preview.stop()
+            result = dict(state)
+            return True
+
+    while True:
+        confirmed = curses.wrapper(run_tui)
+        if not confirmed:
+            print("Calibration cancelled.")
+            restore_wallpaper(client, cfg)
+            client.disconnect()
+            return 0
+        if smooth:
+            break  # smooth mode already served as visual check — skip sweep
+        sweep_cfg = dict(cfg)
+        sweep_cfg["global"] = _state_to_gcfg(result, hue_corr)
+        action = verify_sweep(client, sweep_cfg)
+        if action == "s":
+            break
+        elif action == "q":
+            print("Discarded.")
+            restore_wallpaper(client, cfg)
+            client.disconnect()
+            return 0
+        # action == "r": loop back to TUI
+
+    new_cfg = load_config()
+    if "global" not in new_cfg:
+        new_cfg["global"] = {}
+    g = new_cfg["global"]
+    g["brightness"]        = result["brightness"]
+    g["color_temperature"] = int(result["color_temperature"])
+    g["gain"]              = [result["gain_r"], result["gain_g"], result["gain_b"]]
+    g["gamma"]             = result["gamma"]
+
+    save_config(new_cfg)
+    restore_wallpaper(client, load_config())
+    print(f"Saved to {CONFIG_PATH}")
+    client.disconnect()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="caelestia-rgb-sync",
+        description="Sync RGB lighting to caelestia theme accent color.",
+    )
+    sub = parser.add_subparsers(dest="command", metavar="command")
+    sub.required = True
+
+    sub.add_parser("daemon",  help="Watch scheme file, apply on change (for systemd)")
+    sub.add_parser("apply",   help="Apply current color once and exit")
+    sub.add_parser("devices", help="List OpenRGB devices")
+    sub.add_parser("init",    help="Detect devices and write initial config")
+    sub.add_parser("enable",  help="Enable systemd service (systemctl --user)")
+    sub.add_parser("disable", help="Disable systemd service (systemctl --user)")
+
+    cal = sub.add_parser("calibrate", help="Interactive calibration")
+    cal_sub = cal.add_subparsers(dest="cal_target", metavar="target")
+    cal_sub.required = True
+    cal_dev = cal_sub.add_parser("device", help="Per-device normalization (curses TUI)")
+    cal_dev.add_argument("--smooth", action="store_true",
+                         help="Free hue scrub with a/d instead of fixed color steps")
+    cal_global = cal_sub.add_parser("global", help="Global brightness/temperature/gain/gamma (curses TUI)")
+    cal_global.add_argument("--smooth", action="store_true",
+                            help="Free hue scrub with a/d instead of fixed color steps")
+
+    args = parser.parse_args()
+
+    dispatch = {
+        "daemon":   cmd_daemon,
+        "apply":    cmd_apply,
+        "devices":  cmd_devices,
+        "init":     cmd_init,
+        "enable":   cmd_enable,
+        "disable":  cmd_disable,
+    }
+
+    if args.command in dispatch:
+        return dispatch[args.command](args)
+    elif args.command == "calibrate":
+        if args.cal_target == "device":
+            return cmd_calibrate_device(args)
+        elif args.cal_target == "global":
+            return cmd_calibrate_global(args)
     return 0
 
 
