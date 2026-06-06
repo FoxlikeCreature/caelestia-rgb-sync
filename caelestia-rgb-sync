@@ -338,6 +338,7 @@ class LivePreview:
         self._gc: dict = {}
         self._dirty = threading.Event()
         self._stop = threading.Event()
+        self._modes_initialized: set[int] = set()  # device ids that got set_mode
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
@@ -380,12 +381,15 @@ class LivePreview:
                     color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
                     mode = dc.get("mode", "direct")
                     force = dc.get("force_mode", False)
-                    cur = device.modes[device.active_mode].name if device.modes else ""
-                    if force or cur.lower() != mode.lower():
-                        try:
-                            device.set_mode(mode)
-                        except Exception:
-                            pass
+                    did = id(device)
+                    if did not in self._modes_initialized:
+                        cur = device.modes[device.active_mode].name if device.modes else ""
+                        if force or cur.lower() != mode.lower():
+                            try:
+                                device.set_mode(mode)
+                            except Exception:
+                                pass
+                        self._modes_initialized.add(did)
                     device.set_color(color, fast=True)
                 except Exception:
                     pass
