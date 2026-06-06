@@ -43,16 +43,17 @@ yay -S openrgb python-openrgb python-tomli-w inotify-tools
 
 ## Installation
 
+install from AUR:
+
+```sh
+yay -S caelestia-rgb-sync
+```
+
+Or build from source:
 ```sh
 git clone https://github.com/USERNAME/caelestia-rgb-sync
 cd caelestia-rgb-sync
 bash install.sh
-```
-
-Or install from AUR (once published):
-
-```sh
-yay -S caelestia-rgb-sync
 ```
 
 ## Usage
