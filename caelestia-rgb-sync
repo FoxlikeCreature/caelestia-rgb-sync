@@ -413,7 +413,7 @@ def cmd_init(_args) -> int:
             "color_temperature": 6500,
             "gain": [1.0, 1.0, 1.0],
             "gamma": 1.0,
-            "saturation": 1.0,
+            "saturation": 1.4,
             "hue_corrections": [],
         },
     }
