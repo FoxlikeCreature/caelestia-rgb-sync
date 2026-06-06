@@ -212,12 +212,11 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
 
 
 def restore_wallpaper(client: OpenRGBClient, cfg: dict) -> None:
-    """Restore wallpaper accent color. Falls back to touching scheme file to trigger the daemon."""
+    """Restore wallpaper accent color, then also signal the daemon as a backup."""
     try:
         apply_all(client, cfg)
-        return
     except Exception as e:
-        print(f"warning: restore failed ({e}), signalling daemon...", flush=True)
+        print(f"warning: restore apply failed ({e})", file=sys.stderr, flush=True)
     try:
         SCHEME_PATH.touch()
     except Exception:
@@ -330,7 +329,7 @@ class LivePreview:
     def stop(self) -> None:
         self._stop.set()
         self._dirty.set()
-        self._thread.join(timeout=2.0)
+        self._thread.join()  # wait until fully dead — no timeout
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -343,6 +342,8 @@ class LivePreview:
                 dev_state = self._dev_state
                 gc = self._gc
             for device in self._client.devices:
+                if self._stop.is_set():
+                    break  # abort mid-batch so stop() doesn't race with restore
                 dc = dev_state.get(device.name, {})
                 if dc.get("skip"):
                     continue
