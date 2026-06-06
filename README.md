@@ -125,7 +125,7 @@ brightness        = 1.0
 color_temperature = 6500
 gain              = [1.0, 1.0, 1.0]
 gamma             = 1.0
-saturation        = 1.4
+saturation        = 1.6
 
 # Hue corrections with linear falloff within hue_width.
 # hue_center/hue_width : affected range on the color wheel (0.0-1.0)
