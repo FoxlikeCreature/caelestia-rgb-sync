@@ -8,7 +8,7 @@ Works with any hardware OpenRGB supports - motherboard, GPU, RAM, fans, keyboard
 
 caelestia derives an accent color from your wallpaper and writes it to a config file. This daemon watches that file with inotify and applies the color to all OpenRGB devices instantly via a persistent SDK connection.
 
-Color pipeline per device (strict order):
+Color pipeline per device:
 
 ```
 wallpaper accent hex
@@ -22,7 +22,7 @@ wallpaper accent hex
   -> LED color
 ```
 
-All corrections are multiplicative. `black_point` is a minimum output floor applied after `gain` and `gamma` - it is not an additive offset.
+All corrections are multiplicative. `black_point` is a minimum output floor applied after `gain` and `gamma`.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ All corrections are multiplicative. `black_point` is a minimum output floor appl
 - [tomli-w](https://github.com/hukkin/tomli-w) - for writing config from calibration TUI
 - inotify-tools
 
-Install on Arch/CachyOS:
+Install on Arch/CachyOS/etc:
 
 ```sh
 yay -S openrgb python-openrgb python-tomli-w inotify-tools
