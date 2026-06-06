@@ -1,0 +1,13 @@
+[Unit]
+Description=caelestia RGB daemon — sync lighting to theme accent color
+After=openrgb.service
+BindsTo=openrgb.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/caelestia-rgb-sync
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

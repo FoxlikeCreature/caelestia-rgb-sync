@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+caelestia-rgb-daemon — sync RGB lighting to the caelestia theme accent color.
+
+Runs as a persistent daemon: holds one OpenRGB connection, watches the scheme
+file for changes via inotify, and applies colors instantly.
+
+Config: ~/.config/caelestia-rgb/config.toml
+"""
+
+import colorsys
+import re
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+from openrgb import OpenRGBClient
+from openrgb.utils import RGBColor
+
+CONFIG_PATH = Path.home() / ".config/caelestia-rgb/config.toml"
+SCHEME_PATH = Path.home() / ".local/share/caelestia/hypr/scheme/current.conf"
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH, "rb") as f:
+        return tomllib.load(f)
+
+
+def read_scheme_color(variable: str) -> str:
+    pattern = re.compile(rf"^\${re.escape(variable)}\s*=\s*([0-9a-fA-F]{{6}})", re.M)
+    text = SCHEME_PATH.read_text()
+    m = pattern.search(text)
+    if not m:
+        raise ValueError(f"Variable ${variable} not found in {SCHEME_PATH}")
+    return m.group(1)
+
+
+def apply_correction(r: float, g: float, b: float, params: dict) -> tuple[float, float, float]:
+    """Apply one layer of correction (mul + min/max clamp) to an RGB triple (0..1).
+
+    HSV channels are corrected in HSV space, then RGB channels on the result.
+    """
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    h = min(max(h * params.get("h_mul", 1.0), params.get("h_min", 0.0)), params.get("h_max", 1.0))
+    s = min(max(s * params.get("s_mul", 1.0), params.get("s_min", 0.0)), params.get("s_max", 1.0))
+    v = min(max(v * params.get("v_mul", 1.0), params.get("v_min", 0.0)), params.get("v_max", 1.0))
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    r = min(max(r * params.get("r_mul", 1.0), params.get("r_min", 0.0)), params.get("r_max", 1.0))
+    g = min(max(g * params.get("g_mul", 1.0), params.get("g_min", 0.0)), params.get("g_max", 1.0))
+    b = min(max(b * params.get("b_mul", 1.0), params.get("b_min", 0.0)), params.get("b_max", 1.0))
+    return r, g, b
+
+
+def hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
+    return (
+        int(hex_color[0:2], 16) / 255,
+        int(hex_color[2:4], 16) / 255,
+        int(hex_color[4:6], 16) / 255,
+    )
+
+
+def find_device_cfg(name: str, overrides: list[dict]) -> dict:
+    name_lower = name.lower()
+    for override in overrides:
+        if override.get("match", "").lower() in name_lower:
+            return override
+    return {}
+
+
+def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
+    for attempt in range(retries):
+        try:
+            return OpenRGBClient()
+        except Exception:
+            if attempt < retries - 1:
+                print(f"OpenRGB server not ready, retrying... ({attempt+1}/{retries})", flush=True)
+                time.sleep(delay)
+    raise RuntimeError("Could not connect to OpenRGB server after retries")
+
+
+def apply_all(client: OpenRGBClient, cfg: dict) -> None:
+    source    = cfg.get("color_source", "primaryPaletteKeyColor")
+    global_p  = cfg.get("global", {})
+    overrides = cfg.get("devices", [])
+
+    base_hex = read_scheme_color(source)
+    print(f"source color: #{base_hex}  (${source})", flush=True)
+
+    base_rgb = hex_to_rgb(base_hex)
+
+    for device in client.devices:
+        dev_cfg   = find_device_cfg(device.name, overrides)
+        if dev_cfg.get("skip"):
+            continue
+
+        mode_name   = dev_cfg.get("mode",        global_p.get("mode",        "direct"))
+        force_mode  = dev_cfg.get("force_mode",  global_p.get("force_mode",  False))
+        fast        = dev_cfg.get("fast",        global_p.get("fast",        True))
+
+        # Two-pass correction: global first, then per-device on top.
+        r, g, b = apply_correction(*base_rgb, global_p)
+        r, g, b = apply_correction(r, g, b, dev_cfg)
+        color = RGBColor(int(r * 255), int(g * 255), int(b * 255))
+
+        current_mode = device.modes[device.active_mode].name if device.modes else ""
+        if force_mode or current_mode.lower() != mode_name.lower():
+            device.set_mode(mode_name)
+
+        device.set_color(color, fast=fast)
+        print(f"  {device.name:45s} mode={mode_name:8s} color=#{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
+
+
+def watch_scheme() -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            "inotifywait", "-m", "-e", "close_write,moved_to,create",
+            "--format", "%f",
+            str(SCHEME_PATH.parent),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+
+
+def main() -> int:
+    cfg = load_config()
+
+    print("Connecting to OpenRGB...", flush=True)
+    try:
+        client = connect()
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"Connected. {len(client.devices)} devices.", flush=True)
+
+    try:
+        apply_all(client, cfg)
+    except Exception as e:
+        print(f"warning: initial apply failed: {e}", file=sys.stderr)
+
+    print(f"Watching {SCHEME_PATH} for changes...", flush=True)
+    watcher = watch_scheme()
+    target  = SCHEME_PATH.name
+
+    try:
+        for line in watcher.stdout:
+            if line.strip() != target:
+                continue
+
+            cfg = load_config()
+
+            try:
+                apply_all(client, cfg)
+            except Exception as e:
+                print(f"connection lost ({e}), reconnecting...", flush=True)
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+                try:
+                    client = connect()
+                    apply_all(client, cfg)
+                except Exception as e2:
+                    print(f"reconnect failed: {e2}", file=sys.stderr)
+    finally:
+        watcher.kill()
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
