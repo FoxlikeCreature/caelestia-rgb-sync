@@ -215,6 +215,10 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
         dc = devices_cfg.get(_ik)
         if dc is None:
             dc = find_device_cfg(device.name, devices_cfg)
+        else:
+            _base = find_device_cfg(device.name, devices_cfg)
+            if _base and id(_base) != id(dc):
+                dc = {**_base, **dc}
         if dc.get("skip"):
             continue
         try:
@@ -291,7 +295,7 @@ def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = N
                     fill = curses.color_pair(PAIR_IDX)
                     for row in range(h - 2):
                         stdscr.addstr(row, 0, " " * w, fill)
-                hint = " Enter/s: save   r: back to calibration   q: cancel "
+                hint = " Enter/s: confirm   r: back to calibration   q: cancel "
                 stdscr.addstr(h - 1, max(0, (w - len(hint)) // 2),
                               hint[:w], curses.A_REVERSE)
                 stdscr.refresh()
@@ -309,7 +313,7 @@ def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = N
                 result[0] = "s"
                 return
 
-            time.sleep(0.025)
+            time.sleep(0.05)
 
     curses.wrapper(run)
     return result[0]
@@ -375,8 +379,9 @@ class LivePreview:
                         dr, dg, db = global_correction(dr, dg, db, gc)
                     color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
                     mode = dc.get("mode", "direct")
+                    force = dc.get("force_mode", False)
                     cur = device.modes[device.active_mode].name if device.modes else ""
-                    if cur.lower() != mode.lower():
+                    if force or cur.lower() != mode.lower():
                         try:
                             device.set_mode(mode)
                         except Exception:
@@ -501,6 +506,7 @@ def cmd_daemon(_args) -> int:
             cfg = load_config()
             try:
                 apply_all(client, cfg)
+                time.sleep(0.2)
             except Exception as e:
                 print(f"connection lost ({e}), reconnecting...", flush=True)
                 try:
@@ -611,6 +617,10 @@ def cmd_calibrate_device(args) -> int:
             orig = devices_cfg.get(cfg_key)
             if orig is None:
                 orig = find_device_cfg(d.name, devices_cfg)
+            else:
+                _base = find_device_cfg(d.name, devices_cfg)
+                if _base and id(_base) != id(orig):
+                    orig = {**_base, **orig}
         else:
             cfg_key = d.name
             orig = find_device_cfg(d.name, devices_cfg)
@@ -632,25 +642,25 @@ def cmd_calibrate_device(args) -> int:
         client.disconnect()
         return 1
 
-    # Each device: 3 channel rows (R, G, B)
-    rows: list[tuple[str, int]] = []
+    # Each device: 3 channel rows (R, G, B) + force_mode toggle row
+    rows: list[tuple] = []
     for k in active_keys:
         for ch in range(3):
             rows.append((k, ch))
+        rows.append((k, "force"))
 
     def _visual_h(start: int, end: int) -> int:
-        """Count visual lines for rows[start:end] (separator after B row)."""
+        """Count visual lines for rows[start:end] (separator after force row)."""
         h = 0
         for i in range(start, min(end, len(rows))):
             _, ch = rows[i]
             h += 1
-            if ch == 2:
+            if ch == "force":
                 h += 1
         return h
 
     def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
                     hint1: str, hint2: str, header: str,
-                    preview_saturation: float = 1.0,
                     view_start: int = 0) -> None:
         stdscr.erase()
         H, W = stdscr.getmaxyx()
@@ -679,20 +689,27 @@ def cmd_calibrate_device(args) -> int:
                 break
             dc = dev_state[name]
             is_sel = ri == row_idx
-            ch_marker = ">" if is_sel else " "
-            dev_display = name[:32] if ch == 0 else ""
-            vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
-            row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
-            for fi, v in enumerate(vals):
-                cell = f"{v:8.3f}   "
-                row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
-            _draw_device_row(stdscr, display_row, W, row_str)
-            display_row += 1
-            if ch == 2 and display_row < content_end:
-                line(display_row)
+            if ch == "force":
+                marker = ">" if is_sel else " "
+                val_str = "YES" if dc.get("force_mode", False) else "NO "
+                row_str = f"  {'':32} {marker}force_mode: {val_str}   (f or +/-: toggle; use if device ignores commands)"
+                _draw_device_row(stdscr, display_row, W, row_str)
+                display_row += 1
+                if display_row < content_end:
+                    line(display_row)
+                    display_row += 1
+            else:
+                ch_marker = ">" if is_sel else " "
+                dev_display = name[:32] if ch == 0 else ""
+                vals = [dc["gain"][ch], dc["gamma"][ch], dc["black_point"][ch]]
+                row_str = f"  {dev_display:<32} {ch_marker}{CH_LABELS[ch]}  "
+                for fi, v in enumerate(vals):
+                    cell = f"{v:8.3f}   "
+                    row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
+                _draw_device_row(stdscr, display_row, W, row_str)
                 display_row += 1
 
-        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   [/]: sat ({preview_saturation:.2f})")
+        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   f: force_mode")
         line(H - 2, hint2)
         try:
             stdscr.addstr(H - 1, 0, ("+" + "-" * (W - 2) + "+")[:W])
@@ -701,25 +718,23 @@ def cmd_calibrate_device(args) -> int:
         stdscr.refresh()
 
     def draw_step(stdscr, step_idx: int, row_idx: int, field_idx: int, step_size_idx: int,
-                  preview_saturation: float = 1.0, view_start: int = 0) -> None:
+                  view_start: int = 0) -> None:
         label, _sr, _sg, _sb = CAL_STEPS[step_idx]
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
             hint1=f"All devices: {label}. Adjust R/G/B per device to match brightness and hue.",
-            hint2="Enter: next color   q: cancel",
+            hint2="Enter: confirm   q: cancel",
             header=f"Device calibration - {label} ({step_idx+1}/{len(CAL_STEPS)})",
-            preview_saturation=preview_saturation,
             view_start=view_start,
         )
 
     def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int,
-                    preview_saturation: float = 1.0, view_start: int = 0) -> None:
+                    view_start: int = 0) -> None:
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
             hint1=f"a/d: hue ({hue*360:.0f} deg)   scrub across the color wheel to find problem hues.",
             hint2="Enter: save   q: cancel",
             header="Device calibration - smooth",
-            preview_saturation=preview_saturation,
             view_start=view_start,
         )
 
@@ -752,7 +767,7 @@ def cmd_calibrate_device(args) -> int:
                             dev_state, gc={"saturation": preview_saturation})
 
             while True:
-                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, preview_saturation, view_start)
+                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -795,19 +810,15 @@ def cmd_calibrate_device(args) -> int:
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key == ord('['):
-                    preview_saturation = max(0.5, round(preview_saturation - 0.05, 2))
+                elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
+                    dc["force_mode"] = not dc.get("force_mode", False)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key == ord(']'):
-                    preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('='), ord('+')):
+                elif key in (ord('='), ord('+')) and ch != "force":
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('-'), ord('_')):
+                elif key in (ord('-'), ord('_')) and ch != "force":
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
@@ -819,7 +830,7 @@ def cmd_calibrate_device(args) -> int:
                             dev_state, gc={"saturation": preview_saturation})
 
             while step_idx < len(CAL_STEPS):
-                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, preview_saturation, view_start)
+                draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 name, ch = rows[row_idx]
@@ -853,21 +864,17 @@ def cmd_calibrate_device(args) -> int:
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key == ord('['):
-                    preview_saturation = max(0.5, round(preview_saturation - 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key == ord(']'):
-                    preview_saturation = min(3.0, round(preview_saturation + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
-                elif key in (ord('='), ord('+')):
+                elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
+                    dc["force_mode"] = not dc.get("force_mode", False)
+                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
+                                    dev_state, gc={"saturation": preview_saturation})
+                elif key in (ord('='), ord('+')) and ch != "force":
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('-'), ord('_')):
+                elif key in (ord('-'), ord('_')) and ch != "force":
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
                                     dev_state, gc={"saturation": preview_saturation})
@@ -910,6 +917,7 @@ def cmd_calibrate_device(args) -> int:
         new_cfg["devices"][name]["gamma"]       = dc["gamma"]
         new_cfg["devices"][name]["black_point"] = dc["black_point"]
         new_cfg["devices"][name]["fast"]        = dc["fast"]
+        new_cfg["devices"][name]["force_mode"]  = dc.get("force_mode", False)
 
     save_config(new_cfg)
     restore_wallpaper(client, load_config())
@@ -1013,12 +1021,16 @@ def cmd_calibrate_global(args) -> int:
         _dc = dev_cfgs.get(_ik)
         if _dc is None:
             _dc = find_device_cfg(_d.name, dev_cfgs)
-        if _dc.get("skip"):
+        else:
+            _base = find_device_cfg(_d.name, dev_cfgs)
+            if _base and id(_base) != id(_dc):
+                _dc = {**_base, **_dc}
+        if (_dc or {}).get("skip"):
             continue
         live_dev_state[_ik if _ik in dev_cfgs else _d.name] = _dc
 
     def draw(stdscr, step_idx: int, param_idx: int, preview_brightness: float,
-             header: str = "", hint2: str = "Enter: next color   q: cancel",
+             header: str = "", hint2: str = "Enter: confirm   q: cancel",
              override_color: tuple | None = None) -> None:
         stdscr.erase()
         W = stdscr.getmaxyx()[1]
