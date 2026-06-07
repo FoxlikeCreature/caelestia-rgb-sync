@@ -1,6 +1,6 @@
 # Maintainer: FoxlikeCreature <safonovkirill113@gmail.com>
 pkgname=caelestia-rgb-sync
-pkgver=1.2.1
+pkgver=1.2.2
 pkgrel=1
 pkgdesc='Sync RGB lighting to caelestia desktop shell accent color'
 arch=('any')

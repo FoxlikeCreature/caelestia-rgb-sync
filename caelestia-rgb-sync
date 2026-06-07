@@ -237,7 +237,7 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
     _apply_color_zones(device, color, dc, fast)
 
 
-def apply_all(client: OpenRGBClient, cfg: dict) -> None:
+def apply_all(client: OpenRGBClient, cfg: dict, exclude_force: bool = False) -> None:
     source = cfg.get("color_source", "primaryPaletteKeyColor")
     gc = cfg.get("global", {})
     devices_cfg = cfg.get("devices", {})
@@ -245,7 +245,8 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
     base_hex = read_scheme_color(source)
     r, g, b = hex_to_rgb(base_hex)
     r, g, b = apply_saturation(r, g, b, gc)
-    print(f"source: #{base_hex}  (${source})", flush=True)
+    if not exclude_force:
+        print(f"source: #{base_hex}  (${source})", flush=True)
 
     _ns: dict[str, int] = {}
     for device in client.devices:
@@ -260,6 +261,8 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
             if _base and id(_base) != id(dc):
                 dc = {**_base, **dc}
         if dc.get("skip"):
+            continue
+        if exclude_force and dc.get("force_mode"):
             continue
         try:
             dr, dg, db = device_correction(r, g, b, dc)
@@ -594,6 +597,82 @@ def cmd_daemon(_args) -> int:
     except Exception as e:
         print(f"warning: initial apply failed: {e}", file=sys.stderr)
 
+    # --- Background thread for force_mode devices (GPU etc.) ---
+    # Keeps latest pending config; applies it as soon as previous apply finishes.
+    # This prevents the main loop from blocking on slow force_mode applies.
+    _force_cfg: dict | None = None
+    _force_lock = threading.Lock()
+    _force_event = threading.Event()
+    _force_stop = threading.Event()
+
+    def _force_loop() -> None:
+        try:
+            fc = connect()
+        except RuntimeError as e:
+            print(f"force worker: {e}", file=sys.stderr, flush=True)
+            return
+        print(f"Force worker connected. ({sum(1 for d in fc.devices if find_device_cfg(d.name, load_config().get('devices', {})).get('force_mode'))} force devices)", flush=True)
+        try:
+            while not _force_stop.is_set():
+                _force_event.wait(timeout=5.0)
+                _force_event.clear()
+                if _force_stop.is_set():
+                    break
+                with _force_lock:
+                    pending = _force_cfg
+                if pending is None:
+                    continue
+                source = pending.get("color_source", "primaryPaletteKeyColor")
+                gc = pending.get("global", {})
+                devices_cfg = pending.get("devices", {})
+                try:
+                    base_hex = read_scheme_color(source)
+                except Exception as e:
+                    print(f"force worker: read_scheme_color: {e}", file=sys.stderr, flush=True)
+                    continue
+                r, g, b = hex_to_rgb(base_hex)
+                r, g, b = apply_saturation(r, g, b, gc)
+                print(f"source (force): #{base_hex}  (${source})", flush=True)
+                _ns: dict[str, int] = {}
+                for device in fc.devices:
+                    _i = _ns.get(device.name, 0)
+                    _ns[device.name] = _i + 1
+                    _ik = f"{device.name} #{_i}"
+                    dc = devices_cfg.get(_ik)
+                    if dc is None:
+                        dc = find_device_cfg(device.name, devices_cfg)
+                    else:
+                        _base = find_device_cfg(device.name, devices_cfg)
+                        if _base and id(_base) != id(dc):
+                            dc = {**_base, **dc}
+                    if dc.get("skip") or not dc.get("force_mode"):
+                        continue
+                    try:
+                        dr, dg, db = device_correction(r, g, b, dc)
+                        fr, fg, fb = global_correction(dr, dg, db, gc)
+                        color = RGBColor(int(fr * 255), int(fg * 255), int(fb * 255))
+                        set_device_color(device, color, dc, gc)
+                        print(f"  [force] {device.name:45s} #{color.red:02x}{color.green:02x}{color.blue:02x}", flush=True)
+                    except Exception as e:
+                        print(f"  [force] {device.name}: error: {e}", file=sys.stderr, flush=True)
+        finally:
+            try:
+                fc.disconnect()
+            except Exception:
+                pass
+
+    force_thread = threading.Thread(target=_force_loop, daemon=True)
+    force_thread.start()
+
+    def _signal_force(new_cfg: dict) -> None:
+        nonlocal _force_cfg
+        with _force_lock:
+            _force_cfg = new_cfg
+        _force_event.set()
+
+    # Signal force worker with initial config
+    _signal_force(cfg)
+
     print(f"Watching {SCHEME_PATH} ...", flush=True)
     watcher = subprocess.Popen(
         ["inotifywait", "-m", "-e", "close_write,moved_to,create",
@@ -611,7 +690,8 @@ def cmd_daemon(_args) -> int:
                 watcher.stdout.readline()
             cfg = load_config()
             try:
-                apply_all(client, cfg)
+                apply_all(client, cfg, exclude_force=True)
+                _signal_force(cfg)
                 time.sleep(0.2)
             except Exception as e:
                 print(f"connection lost ({e}), reconnecting...", flush=True)
@@ -621,10 +701,13 @@ def cmd_daemon(_args) -> int:
                     pass
                 try:
                     client = connect()
-                    apply_all(client, cfg)
+                    apply_all(client, cfg, exclude_force=True)
+                    _signal_force(cfg)
                 except Exception as e2:
                     print(f"reconnect failed: {e2}", file=sys.stderr)
     finally:
+        _force_stop.set()
+        _force_event.set()
         watcher.kill()
         try:
             client.disconnect()
