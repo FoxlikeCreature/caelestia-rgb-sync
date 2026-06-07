@@ -201,9 +201,16 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
     zones_cfg = dc.get("zones", {})
     if zones_cfg:
         black = RGBColor(0, 0, 0)
+        fr, fg, fb = color.red / 255.0, color.green / 255.0, color.blue / 255.0
         for zone in device.zones:
             zc = zones_cfg.get(zone.name, {})
-            zone.set_color(black if zc.get("skip") else color, fast=fast)
+            if zc.get("skip"):
+                zone.set_color(black, fast=fast)
+            elif any(k in zc for k in ("gain", "gamma", "black_point")):
+                zr, zg, zb = device_correction(fr, fg, fb, zc)
+                zone.set_color(RGBColor(int(zr * 255), int(zg * 255), int(zb * 255)), fast=fast)
+            else:
+                zone.set_color(color, fast=fast)
     else:
         device.set_color(color, fast=fast)
 
@@ -721,10 +728,15 @@ def cmd_calibrate_device(args) -> int:
         dev_zones[cfg_key] = zone_names
         zones_expanded[cfg_key] = False
         orig_zones = orig.get("zones", {})
-        zone_state[cfg_key] = {
-            zn: {"skip": orig_zones.get(zn, {}).get("skip", False)}
-            for zn in zone_names
-        }
+        zone_state[cfg_key] = {}
+        for zn in zone_names:
+            ozc = orig_zones.get(zn, {})
+            zone_state[cfg_key][zn] = {
+                "gain":        list(ozc.get("gain",        [1.0, 1.0, 1.0])),
+                "gamma":       list(ozc.get("gamma",       [1.0, 1.0, 1.0])),
+                "black_point": list(ozc.get("black_point", [0.0, 0.0, 0.0])),
+                "skip":        ozc.get("skip", False),
+            }
         active_keys.append(cfg_key)
 
     if not active_keys:
@@ -740,7 +752,9 @@ def cmd_calibrate_device(args) -> int:
             result.append((k, "force"))
             if zones_expanded.get(k):
                 for zn in dev_zones.get(k, []):
-                    result.append((k, "zone", zn))
+                    for ch in range(3):
+                        result.append((k, "zone", zn, ch))
+                    result.append((k, "zone", zn, "skip"))
         return result
 
     rows: list[tuple] = build_rows()
@@ -748,9 +762,15 @@ def cmd_calibrate_device(args) -> int:
     def _visual_h(start: int, end: int) -> int:
         h = 0
         for i in range(start, min(end, len(rows))):
+            row = rows[i]
             h += 1
-            if i + 1 >= len(rows) or rows[i + 1][0] != rows[i][0]:
-                h += 1  # separator after last row of each device block
+            ch = row[1]
+            # separator after force row (device end, no zones) or after zone skip row
+            if ch == "force" and not zones_expanded.get(row[0]):
+                h += 1
+            elif ch == "zone" and row[3] == "skip":
+                # separator after last zone OR between zones
+                h += 1
         return h
 
     def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
@@ -787,13 +807,29 @@ def cmd_calibrate_device(args) -> int:
             is_last = ri + 1 >= len(rows) or rows[ri + 1][0] != name
 
             if ch == "zone":
-                zone_name = row[2]
+                zone_name, zch = row[2], row[3]
                 zc = zone_state[name][zone_name]
-                marker = ">" if is_sel else " "
-                val_str = "YES" if zc["skip"] else "NO "
-                row_str = f"  {'':32} {marker}  [{zone_name}] skip: {val_str}"
-                _draw_device_row(stdscr, display_row, W, row_str)
-                display_row += 1
+                if zch == "skip":
+                    marker = ">" if is_sel else " "
+                    val_str = "YES" if zc["skip"] else "NO "
+                    row_str = f"  {'':32} {marker}  skip: {val_str}"
+                    _draw_device_row(stdscr, display_row, W, row_str)
+                    display_row += 1
+                    if display_row < content_end:
+                        line(display_row)
+                        display_row += 1
+                    continue
+                else:
+                    ch_marker = ">" if is_sel else " "
+                    zlabel = f"  [{zone_name[:14]}]" if zch == 0 else ""
+                    vals = [zc["gain"][zch], zc["gamma"][zch], zc["black_point"][zch]]
+                    row_str = f"  {zlabel:<32} {ch_marker}{CH_LABELS[zch]}  "
+                    for fi, v in enumerate(vals):
+                        cell = f"{v:8.3f}   "
+                        row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
+                    _draw_device_row(stdscr, display_row, W, row_str)
+                    display_row += 1
+                    continue
             elif ch == "force":
                 marker = ">" if is_sel else " "
                 val_str = "YES" if dc.get("force_mode", False) else "NO "
@@ -803,6 +839,9 @@ def cmd_calibrate_device(args) -> int:
                 row_str = f"  {'':32} {marker}force_mode: {val_str}{z_hint}"
                 _draw_device_row(stdscr, display_row, W, row_str)
                 display_row += 1
+                if not zones_expanded.get(name) and display_row < content_end:
+                    line(display_row)
+                    display_row += 1
             else:
                 ch_marker = ">" if is_sel else " "
                 dev_display = name[:32] if ch == 0 else ""
@@ -812,10 +851,6 @@ def cmd_calibrate_device(args) -> int:
                     cell = f"{v:8.3f}   "
                     row_str += f"\x01{cell}\x02" if (is_sel and fi == field_idx) else cell
                 _draw_device_row(stdscr, display_row, W, row_str)
-                display_row += 1
-
-            if is_last and display_row < content_end:
-                line(display_row)
                 display_row += 1
 
         line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   f: force_mode   z: zones")
@@ -849,11 +884,20 @@ def cmd_calibrate_device(args) -> int:
 
     result: dict | None = None
 
+    _ZONE_DEFAULT = {"gain": [1.0, 1.0, 1.0], "gamma": [1.0, 1.0, 1.0], "black_point": [0.0, 0.0, 0.0]}
+
+    def _zone_is_default(zc: dict) -> bool:
+        return (not zc["skip"] and
+                zc["gain"] == [1.0, 1.0, 1.0] and
+                zc["gamma"] == [1.0, 1.0, 1.0] and
+                zc["black_point"] == [0.0, 0.0, 0.0])
+
     def _merged_dev_state() -> dict:
         merged = {}
         for k, dc in dev_state.items():
             m = dict(dc)
-            zs = {zn: dict(zc) for zn, zc in zone_state.get(k, {}).items() if zc["skip"]}
+            zs = {zn: dict(zc) for zn, zc in zone_state.get(k, {}).items()
+                  if not _zone_is_default(zc)}
             if zs:
                 m["zones"] = zs
             merged[k] = m
@@ -941,9 +985,22 @@ def cmd_calibrate_device(args) -> int:
                     hue = (hue + HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
                     _req(sr, sg, sb)
-                elif ch == "zone" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
-                    zone_state[name][row[2]]["skip"] = not zone_state[name][row[2]]["skip"]
-                    _req(sr, sg, sb)
+                elif ch == "zone":
+                    zn, zch = row[2], row[3]
+                    zc = zone_state[name][zn]
+                    if zch == "skip" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
+                        zc["skip"] = not zc["skip"]
+                        _req(sr, sg, sb)
+                    elif zch != "skip" and key == curses.KEY_RIGHT:
+                        field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
+                    elif zch != "skip" and key == curses.KEY_LEFT:
+                        field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
+                    elif zch != "skip" and key in (ord('='), ord('+')):
+                        zc[DEVICE_FIELDS[field_idx]][zch] = round(zc[DEVICE_FIELDS[field_idx]][zch] + step_size, 4)
+                        _req(sr, sg, sb)
+                    elif zch != "skip" and key in (ord('-'), ord('_')):
+                        zc[DEVICE_FIELDS[field_idx]][zch] = round(max(0.0, zc[DEVICE_FIELDS[field_idx]][zch] - step_size), 4)
+                        _req(sr, sg, sb)
                 elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
                     dc["force_mode"] = not dc.get("force_mode", False)
                     _req(sr, sg, sb)
@@ -997,9 +1054,22 @@ def cmd_calibrate_device(args) -> int:
                 elif key == ord('z'):
                     row_idx = _toggle_zones(row_idx)
                     update_view(row_idx)
-                elif ch == "zone" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
-                    zone_state[name][row[2]]["skip"] = not zone_state[name][row[2]]["skip"]
-                    _req(sr, sg, sb)
+                elif ch == "zone":
+                    zn, zch = row[2], row[3]
+                    zc = zone_state[name][zn]
+                    if zch == "skip" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
+                        zc["skip"] = not zc["skip"]
+                        _req(sr, sg, sb)
+                    elif zch != "skip" and key in (curses.KEY_RIGHT, ord('d')):
+                        field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
+                    elif zch != "skip" and key in (curses.KEY_LEFT, ord('a')):
+                        field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
+                    elif zch != "skip" and key in (ord('='), ord('+')):
+                        zc[DEVICE_FIELDS[field_idx]][zch] = round(zc[DEVICE_FIELDS[field_idx]][zch] + step_size, 4)
+                        _req(sr, sg, sb)
+                    elif zch != "skip" and key in (ord('-'), ord('_')):
+                        zc[DEVICE_FIELDS[field_idx]][zch] = round(max(0.0, zc[DEVICE_FIELDS[field_idx]][zch] - step_size), 4)
+                        _req(sr, sg, sb)
                 elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
                     dc["force_mode"] = not dc.get("force_mode", False)
                     _req(sr, sg, sb)
@@ -1049,9 +1119,19 @@ def cmd_calibrate_device(args) -> int:
         new_cfg["devices"][name]["black_point"] = dc["black_point"]
         new_cfg["devices"][name]["fast"]        = dc["fast"]
         new_cfg["devices"][name]["force_mode"]  = dc.get("force_mode", False)
-        skipped = {zn: {"skip": True} for zn, zc in zone_state.get(name, {}).items() if zc["skip"]}
-        if skipped:
-            new_cfg["devices"][name]["zones"] = skipped
+        saved_zones = {}
+        for zn, zc in zone_state.get(name, {}).items():
+            if not _zone_is_default(zc):
+                entry = {}
+                if zc["skip"]:
+                    entry["skip"] = True
+                else:
+                    entry["gain"]        = zc["gain"]
+                    entry["gamma"]       = zc["gamma"]
+                    entry["black_point"] = zc["black_point"]
+                saved_zones[zn] = entry
+        if saved_zones:
+            new_cfg["devices"][name]["zones"] = saved_zones
         else:
             new_cfg["devices"][name].pop("zones", None)
 
