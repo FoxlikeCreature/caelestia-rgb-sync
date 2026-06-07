@@ -186,20 +186,37 @@ def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
 
 def _apply_color_zones(device, color: RGBColor, dc: dict, fast: bool) -> None:
     zones_cfg = dc.get("zones", {})
-    if zones_cfg:
-        black = RGBColor(0, 0, 0)
-        fr, fg, fb = color.red / 255.0, color.green / 255.0, color.blue / 255.0
-        for zone in device.zones:
-            zc = zones_cfg.get(zone.name, {})
-            if zc.get("skip"):
-                zone.set_color(black, fast=fast)
-            elif any(k in zc for k in ("gain", "gamma", "black_point")):
-                zr, zg, zb = device_correction(fr, fg, fb, zc)
-                zone.set_color(RGBColor(int(zr * 255), int(zg * 255), int(zb * 255)), fast=fast)
-            else:
-                zone.set_color(color, fast=fast)
-    else:
+    if not zones_cfg:
         device.set_color(color, fast=fast)
+        return
+
+    black = RGBColor(0, 0, 0)
+    fr, fg, fb = color.red / 255.0, color.green / 255.0, color.blue / 255.0
+
+    zone_color_map: dict[str, RGBColor] = {}
+    for zone in device.zones:
+        zc = zones_cfg.get(zone.name, {})
+        if zc.get("skip"):
+            zone_color_map[zone.name] = black
+        elif any(k in zc for k in ("gain", "gamma", "black_point")):
+            zr, zg, zb = device_correction(fr, fg, fb, zc)
+            zone_color_map[zone.name] = RGBColor(int(zr * 255), int(zg * 255), int(zb * 255))
+
+    if not zone_color_map:
+        device.set_color(color, fast=fast)
+        return
+
+    # Build per-LED color list and send as one UPDATELEDS packet.
+    # zone.leds[x].id is the absolute device-level LED index.
+    # Use _set_device_colors() directly to bypass the PER_LED mode check in
+    # set_colors() — we already put the device in direct mode via set_device_color().
+    led_colors = [color] * len(device.leds)
+    for zone in device.zones:
+        if zone.name in zone_color_map:
+            zcolor = zone_color_map[zone.name]
+            for led in zone.leds:
+                led_colors[led.id] = zcolor
+    device._set_device_colors(led_colors, fast)
 
 
 def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
@@ -253,11 +270,15 @@ def apply_all(client: OpenRGBClient, cfg: dict) -> None:
             print(f"  {device.name}: error: {e}", file=sys.stderr, flush=True)
 
 
-def restore_wallpaper(client: OpenRGBClient, cfg: dict) -> None:
+def restore_wallpaper(cfg: dict) -> None:
     """Restore wallpaper accent color, then also signal the daemon as a backup."""
     time.sleep(0.1)  # let openrgb settle after rapid live-preview updates
     try:
-        apply_all(client, cfg)
+        fresh = connect()
+        try:
+            apply_all(fresh, cfg)
+        finally:
+            fresh.disconnect()
     except Exception as e:
         print(f"warning: restore apply failed ({e})", file=sys.stderr, flush=True)
     try:
@@ -1092,7 +1113,7 @@ def cmd_calibrate_device(args) -> int:
         confirmed = curses.wrapper(run_tui)
         if not confirmed:
             print("Calibration cancelled.")
-            restore_wallpaper(client, cfg)
+            restore_wallpaper(cfg)
             client.disconnect()
             return 0
         if smooth:
@@ -1102,7 +1123,7 @@ def cmd_calibrate_device(args) -> int:
             break
         elif action == "q":
             print("Discarded.")
-            restore_wallpaper(client, cfg)
+            restore_wallpaper(cfg)
             client.disconnect()
             return 0
 
@@ -1140,7 +1161,9 @@ def cmd_calibrate_device(args) -> int:
             new_cfg["devices"][name].pop("zones", None)
 
     save_config(new_cfg)
-    restore_wallpaper(client, load_config())
+    subprocess.run(["systemctl", "--user", "try-restart", "caelestia-rgb.service"],
+                   capture_output=True, check=False)
+    restore_wallpaper(new_cfg)
     print(f"Saved to {CONFIG_PATH}")
     client.disconnect()
     return 0
@@ -1575,7 +1598,7 @@ def cmd_calibrate_global(args) -> int:
         confirmed = curses.wrapper(run_tui)
         if not confirmed:
             print("Calibration cancelled.")
-            restore_wallpaper(client, cfg)
+            restore_wallpaper(cfg)
             client.disconnect()
             return 0
         if smooth:
@@ -1587,7 +1610,7 @@ def cmd_calibrate_global(args) -> int:
             break
         elif action == "q":
             print("Discarded.")
-            restore_wallpaper(client, cfg)
+            restore_wallpaper(cfg)
             client.disconnect()
             return 0
         # action == "r": loop back to TUI
@@ -1604,7 +1627,9 @@ def cmd_calibrate_global(args) -> int:
     g["hue_corrections"]   = result_hue_corr
 
     save_config(new_cfg)
-    restore_wallpaper(client, load_config())
+    subprocess.run(["systemctl", "--user", "try-restart", "caelestia-rgb.service"],
+                   capture_output=True, check=False)
+    restore_wallpaper(new_cfg)
     print(f"Saved to {CONFIG_PATH}")
     client.disconnect()
     return 0
