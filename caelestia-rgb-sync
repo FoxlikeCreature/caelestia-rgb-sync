@@ -188,10 +188,15 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
     mode_name = dc.get("mode", gc.get("mode", "direct"))
     force = dc.get("force_mode", gc.get("force_mode", False))
     fast = dc.get("fast", gc.get("fast", True))
+    actual_mode = next((m for m in device.modes if m.name.lower() == mode_name.lower()), None)
     cur = device.modes[device.active_mode].name if device.modes else ""
     if force or cur.lower() != mode_name.lower():
         try:
-            device.set_mode(mode_name)
+            if actual_mode is not None:
+                if actual_mode.brightness_max is not None and actual_mode.brightness is not None:
+                    actual_mode.brightness = max(actual_mode.brightness_min or 0,
+                                                 min(actual_mode.brightness_max, actual_mode.brightness))
+            device.set_mode(actual_mode.name if actual_mode else mode_name)
         except Exception as e:
             print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
     device.set_color(color, fast=fast)
