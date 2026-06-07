@@ -193,9 +193,8 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
     if force or cur.lower() != mode_name.lower():
         try:
             if actual_mode is not None:
-                if actual_mode.brightness_max is not None and actual_mode.brightness is not None:
-                    actual_mode.brightness = max(actual_mode.brightness_min or 0,
-                                                 min(actual_mode.brightness_max, actual_mode.brightness))
+                if actual_mode.brightness_max is not None:
+                    actual_mode.brightness = actual_mode.brightness_max
             device.set_mode(actual_mode.name if actual_mode else mode_name)
         except Exception as e:
             print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
