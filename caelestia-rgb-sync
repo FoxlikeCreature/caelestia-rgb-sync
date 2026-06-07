@@ -184,20 +184,7 @@ def connect(retries: int = 10, delay: float = 3.0) -> OpenRGBClient:
     raise RuntimeError("Could not connect to OpenRGB server")
 
 
-def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
-    mode_name = dc.get("mode", gc.get("mode", "direct"))
-    force = dc.get("force_mode", gc.get("force_mode", False))
-    fast = dc.get("fast", gc.get("fast", True))
-    cur = device.modes[device.active_mode].name if device.modes else ""
-    if force or cur.lower() != mode_name.lower():
-        try:
-            for m in device.modes:
-                if m.name.lower() == mode_name.lower() and m.brightness_max is not None:
-                    m.brightness = m.brightness_max
-                    break
-            device.set_mode(mode_name)
-        except Exception as e:
-            print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
+def _apply_color_zones(device, color: RGBColor, dc: dict, fast: bool) -> None:
     zones_cfg = dc.get("zones", {})
     if zones_cfg:
         black = RGBColor(0, 0, 0)
@@ -213,6 +200,23 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
                 zone.set_color(color, fast=fast)
     else:
         device.set_color(color, fast=fast)
+
+
+def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
+    mode_name = dc.get("mode", gc.get("mode", "direct"))
+    force = dc.get("force_mode", gc.get("force_mode", False))
+    fast = dc.get("fast", gc.get("fast", True))
+    cur = device.modes[device.active_mode].name if device.modes else ""
+    if force or cur.lower() != mode_name.lower():
+        try:
+            for m in device.modes:
+                if m.name.lower() == mode_name.lower() and m.brightness_max is not None:
+                    m.brightness = m.brightness_max
+                    break
+            device.set_mode(mode_name)
+        except Exception as e:
+            print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
+    _apply_color_zones(device, color, dc, fast)
 
 
 def apply_all(client: OpenRGBClient, cfg: dict) -> None:
@@ -414,7 +418,14 @@ class LivePreview:
                     if gc:
                         dr, dg, db = global_correction(dr, dg, db, gc)
                     color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
-                    set_device_color(device, color, dc, gc)
+                    mode = dc.get("mode", "direct")
+                    cur = device.modes[device.active_mode].name if device.modes else ""
+                    if cur.lower() != mode.lower():
+                        try:
+                            device.set_mode(mode)
+                        except Exception:
+                            pass
+                    _apply_color_zones(device, color, dc, fast=True)
                 except Exception:
                     pass
 
@@ -447,7 +458,12 @@ class LivePreview:
                         if gc:
                             dr, dg, db = global_correction(dr, dg, db, gc)
                         color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
-                        set_device_color(device, color, dc, gc)
+                        mode = dc.get("mode", "direct")
+                        try:
+                            device.set_mode(mode)
+                        except Exception:
+                            pass
+                        _apply_color_zones(device, color, dc, fast=True)
                     except Exception:
                         pass
         finally:
