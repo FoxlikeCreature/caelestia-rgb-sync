@@ -414,14 +414,7 @@ class LivePreview:
                     if gc:
                         dr, dg, db = global_correction(dr, dg, db, gc)
                     color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
-                    mode = dc.get("mode", "direct")
-                    cur = device.modes[device.active_mode].name if device.modes else ""
-                    if cur.lower() != mode.lower():
-                        try:
-                            device.set_mode(mode)
-                        except Exception:
-                            pass
-                    device.set_color(color, fast=True)
+                    set_device_color(device, color, dc, gc)
                 except Exception:
                     pass
 
@@ -454,12 +447,7 @@ class LivePreview:
                         if gc:
                             dr, dg, db = global_correction(dr, dg, db, gc)
                         color = RGBColor(int(dr * 255), int(dg * 255), int(db * 255))
-                        mode = dc.get("mode", "direct")
-                        try:
-                            device.set_mode(mode)
-                        except Exception:
-                            pass
-                        device.set_color(color, fast=True)
+                        set_device_color(device, color, dc, gc)
                     except Exception:
                         pass
         finally:
