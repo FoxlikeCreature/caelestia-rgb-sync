@@ -898,10 +898,11 @@ def cmd_calibrate_device(args) -> int:
         )
 
     def draw_smooth(stdscr, hue: float, row_idx: int, field_idx: int, step_size_idx: int,
-                    view_start: int = 0) -> None:
+                    view_start: int = 0, preview_brightness: float = 1.0,
+                    preview_saturation: float = 1.0) -> None:
         _draw_table(
             stdscr, row_idx, field_idx, STEPS[step_size_idx],
-            hint1=f"a/d: hue ({hue*360:.0f} deg)   scrub across the color wheel to find problem hues.",
+            hint1=f"a/d: hue ({hue*360:.0f} deg)   w/s: sat ({preview_saturation:.2f})   r/f: brightness ({preview_brightness:.2f})",
             hint2="Enter: save   q: cancel",
             header="Device calibration - smooth",
             view_start=view_start,
@@ -967,7 +968,8 @@ def cmd_calibrate_device(args) -> int:
             _req(sr, sg, sb)
 
             while True:
-                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, view_start)
+                draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, view_start,
+                            preview_brightness=preview_brightness, preview_saturation=preview_saturation)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
                 row = rows[row_idx]
@@ -997,9 +999,15 @@ def cmd_calibrate_device(args) -> int:
                     row_idx = _toggle_zones(row_idx)
                     update_view(row_idx)
                 elif key == ord('w'):
-                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    preview_saturation = round(preview_saturation + 0.05, 2)
                     _req(sr, sg, sb)
                 elif key == ord('s'):
+                    preview_saturation = max(0.05, round(preview_saturation - 0.05, 2))
+                    _req(sr, sg, sb)
+                elif key == ord('r'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    _req(sr, sg, sb)
+                elif key == ord('f'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
                     _req(sr, sg, sb)
                 elif key == ord('a'):
@@ -1330,7 +1338,8 @@ def cmd_calibrate_global(args) -> int:
     _CORR_FIELD_LABELS = ["center", "width", "R", "G", "B"]
 
     def draw_smooth_global(stdscr, hue: float, row_idx: int, corr_field_idx: int,
-                           preview_brightness: float, live_hue_corr: list) -> None:
+                           preview_brightness: float, preview_saturation: float,
+                           live_hue_corr: list) -> None:
         stdscr.erase()
         W = stdscr.getmaxyx()[1]
         n_params = len(GLOBAL_PARAMS)
@@ -1347,7 +1356,7 @@ def cmd_calibrate_global(args) -> int:
             stdscr.addstr(0, 0, ("+" + f" {hdr} ").ljust(W - 1, "-") + "+")
         except curses.error:
             pass
-        line(1, f"Adjust until LEDs match the block. w/s: brightness ({preview_brightness:.2f})")
+        line(1, f"Adjust until LEDs match the block. w/s: sat ({preview_saturation:.2f})   r/f: brightness ({preview_brightness:.2f})")
         line(2, "")
 
         _draw_color_block(stdscr, 3, W,
@@ -1426,6 +1435,7 @@ def cmd_calibrate_global(args) -> int:
 
         param_idx = 0
         preview_brightness = 1.0
+        preview_saturation = state.get("saturation", 1.0)
         preview = LivePreview(client)
 
         if smooth:
@@ -1454,12 +1464,15 @@ def cmd_calibrate_global(args) -> int:
                             live_dev_state, gc=_state_to_gcfg(state, live_hue_corr))
 
             while True:
-                draw_smooth_global(stdscr, hue, row_idx, corr_field_idx, preview_brightness, live_hue_corr)
+                draw_smooth_global(stdscr, hue, row_idx, corr_field_idx,
+                                   preview_brightness, preview_saturation, live_hue_corr)
                 key = stdscr.getch()
 
                 def send_s() -> None:
+                    gc = _state_to_gcfg(state, live_hue_corr)
+                    gc["saturation"] = preview_saturation
                     preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    live_dev_state, gc=_state_to_gcfg(state, live_hue_corr))
+                                    live_dev_state, gc=gc)
 
                 if key == ord('q'):
                     preview.stop()
@@ -1488,9 +1501,15 @@ def cmd_calibrate_global(args) -> int:
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
                     send_s()
                 elif key == ord('w'):
-                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    preview_saturation = round(preview_saturation + 0.05, 2)
                     send_s()
                 elif key == ord('s'):
+                    preview_saturation = max(0.05, round(preview_saturation - 0.05, 2))
+                    send_s()
+                elif key == ord('r'):
+                    preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
+                    send_s()
+                elif key == ord('f'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
                     send_s()
                 elif key == ord('n') or (
@@ -1513,6 +1532,8 @@ def cmd_calibrate_global(args) -> int:
                     if row_idx < n_params:
                         p_key, _, step_size, lo, hi = GLOBAL_PARAMS[row_idx]
                         state[p_key] = min(hi, round(state[p_key] + step_size, 4))
+                        if p_key == "saturation":
+                            preview_saturation = state[p_key]
                         send_s()
                     elif n_params <= row_idx < n_params + len(live_hue_corr):
                         ci = row_idx - n_params
@@ -1531,6 +1552,8 @@ def cmd_calibrate_global(args) -> int:
                     if row_idx < n_params:
                         p_key, _, step_size, lo, hi = GLOBAL_PARAMS[row_idx]
                         state[p_key] = max(lo, round(state[p_key] - step_size, 4))
+                        if p_key == "saturation":
+                            preview_saturation = state[p_key]
                         send_s()
                     elif n_params <= row_idx < n_params + len(live_hue_corr):
                         ci = row_idx - n_params
