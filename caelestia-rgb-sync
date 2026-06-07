@@ -16,6 +16,7 @@ Commands:
 import argparse
 import colorsys
 import curses
+import json
 import math
 import re
 import select
@@ -31,7 +32,7 @@ from openrgb import OpenRGBClient
 from openrgb.utils import RGBColor
 
 CONFIG_PATH = Path.home() / ".config/caelestia-rgb/config.toml"
-SCHEME_PATH = Path.home() / ".local/share/caelestia/hypr/scheme/current.conf"
+SCHEME_PATH = Path.home() / ".local/state/caelestia/scheme.json"
 STEPS = [0.05, 0.01, 0.001]
 HUE_STEP = 2.0  # degrees per a/d keypress in smooth mode
 
@@ -162,11 +163,11 @@ def find_device_cfg(name: str, devices_cfg: dict) -> dict:
 
 
 def read_scheme_color(variable: str) -> str:
-    pattern = re.compile(rf"^\${re.escape(variable)}\s*=\s*([0-9a-fA-F]{{6}})", re.M)
-    m = pattern.search(SCHEME_PATH.read_text())
-    if not m:
-        raise ValueError(f"${variable} not found in {SCHEME_PATH}")
-    return m.group(1)
+    data = json.loads(SCHEME_PATH.read_text())
+    colour = data.get("colours", {}).get(variable)
+    if not colour:
+        raise ValueError(f"{variable!r} not found in {SCHEME_PATH}")
+    return colour
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +282,6 @@ def restore_wallpaper(cfg: dict) -> None:
             fresh.disconnect()
     except Exception as e:
         print(f"warning: restore apply failed ({e})", file=sys.stderr, flush=True)
-    try:
-        # write_text generates IN_CLOSE_WRITE; Path.touch() only generates IN_ATTRIB
-        # which the daemon watcher does not listen to
-        SCHEME_PATH.write_text(SCHEME_PATH.read_text())
-    except Exception:
-        pass
 
 
 def verify_sweep(client: OpenRGBClient, cfg: dict, dev_override: dict | None = None) -> str:
