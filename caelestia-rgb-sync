@@ -188,22 +188,24 @@ def set_device_color(device, color: RGBColor, dc: dict, gc: dict) -> None:
     mode_name = dc.get("mode", gc.get("mode", "direct"))
     force = dc.get("force_mode", gc.get("force_mode", False))
     fast = dc.get("fast", gc.get("fast", True))
-    actual_mode = next((m for m in device.modes if m.name.lower() == mode_name.lower()), None)
     cur = device.modes[device.active_mode].name if device.modes else ""
     if force or cur.lower() != mode_name.lower():
         try:
-            if actual_mode is not None and actual_mode.brightness_max is not None:
-                actual_mode.brightness = actual_mode.brightness_max
-            device.set_mode(actual_mode.name if actual_mode else mode_name)
+            for m in device.modes:
+                if m.name.lower() == mode_name.lower() and m.brightness_max is not None:
+                    m.brightness = m.brightness_max
+                    break
+            device.set_mode(mode_name)
         except Exception as e:
             print(f"  warning: set_mode({mode_name!r}) failed for {device.name}: {e}", flush=True)
-    device.set_color(color, fast=fast)
-    skip_zones = dc.get("skip_zones", [])
-    if skip_zones:
+    zones_cfg = dc.get("zones", {})
+    if zones_cfg:
         black = RGBColor(0, 0, 0)
         for zone in device.zones:
-            if zone.name in skip_zones:
-                zone.set_color(black, fast=fast)
+            zc = zones_cfg.get(zone.name, {})
+            zone.set_color(black if zc.get("skip") else color, fast=fast)
+    else:
+        device.set_color(color, fast=fast)
 
 
 def apply_all(client: OpenRGBClient, cfg: dict) -> None:
@@ -683,6 +685,9 @@ def cmd_calibrate_device(args) -> int:
 
     dev_state: dict[str, dict] = {}
     active_keys: list[str] = []
+    dev_zones: dict[str, list[str]] = {}
+    zones_expanded: dict[str, bool] = {}
+    zone_state: dict[str, dict[str, dict]] = {}
     devices_cfg = cfg.get("devices", {})
     _ns: dict[str, int] = {}
 
@@ -712,6 +717,14 @@ def cmd_calibrate_device(args) -> int:
             "force_mode":  orig.get("force_mode", False),
             "fast":        orig.get("fast", True),
         }
+        zone_names = [z.name for z in d.zones]
+        dev_zones[cfg_key] = zone_names
+        zones_expanded[cfg_key] = False
+        orig_zones = orig.get("zones", {})
+        zone_state[cfg_key] = {
+            zn: {"skip": orig_zones.get(zn, {}).get("skip", False)}
+            for zn in zone_names
+        }
         active_keys.append(cfg_key)
 
     if not active_keys:
@@ -719,21 +732,25 @@ def cmd_calibrate_device(args) -> int:
         client.disconnect()
         return 1
 
-    # Each device: 3 channel rows (R, G, B) + force_mode toggle row
-    rows: list[tuple] = []
-    for k in active_keys:
-        for ch in range(3):
-            rows.append((k, ch))
-        rows.append((k, "force"))
+    def build_rows() -> list[tuple]:
+        result: list[tuple] = []
+        for k in active_keys:
+            for ch in range(3):
+                result.append((k, ch))
+            result.append((k, "force"))
+            if zones_expanded.get(k):
+                for zn in dev_zones.get(k, []):
+                    result.append((k, "zone", zn))
+        return result
+
+    rows: list[tuple] = build_rows()
 
     def _visual_h(start: int, end: int) -> int:
-        """Count visual lines for rows[start:end] (separator after force row)."""
         h = 0
         for i in range(start, min(end, len(rows))):
-            _, ch = rows[i]
             h += 1
-            if ch == "force":
-                h += 1
+            if i + 1 >= len(rows) or rows[i + 1][0] != rows[i][0]:
+                h += 1  # separator after last row of each device block
         return h
 
     def _draw_table(stdscr, row_idx: int, field_idx: int, step_size: float,
@@ -759,22 +776,33 @@ def cmd_calibrate_device(args) -> int:
 
         content_end = H - 3  # rows H-3, H-2, H-1 are hint + hint + border
         display_row = 5
-        for ri, (name, ch) in enumerate(rows):
+        for ri, row in enumerate(rows):
             if ri < view_start:
                 continue
             if display_row >= content_end:
                 break
+            name, ch = row[0], row[1]
             dc = dev_state[name]
             is_sel = ri == row_idx
-            if ch == "force":
+            is_last = ri + 1 >= len(rows) or rows[ri + 1][0] != name
+
+            if ch == "zone":
+                zone_name = row[2]
+                zc = zone_state[name][zone_name]
                 marker = ">" if is_sel else " "
-                val_str = "YES" if dc.get("force_mode", False) else "NO "
-                row_str = f"  {'':32} {marker}force_mode: {val_str}   (f or +/-: toggle; use if device ignores commands)"
+                val_str = "YES" if zc["skip"] else "NO "
+                row_str = f"  {'':32} {marker}  [{zone_name}] skip: {val_str}"
                 _draw_device_row(stdscr, display_row, W, row_str)
                 display_row += 1
-                if display_row < content_end:
-                    line(display_row)
-                    display_row += 1
+            elif ch == "force":
+                marker = ">" if is_sel else " "
+                val_str = "YES" if dc.get("force_mode", False) else "NO "
+                nz = len(dev_zones.get(name, []))
+                exp = zones_expanded.get(name, False)
+                z_hint = f"   z: {'▼' if exp else '▶'} {nz} zone{'s' if nz != 1 else ''}" if nz else ""
+                row_str = f"  {'':32} {marker}force_mode: {val_str}{z_hint}"
+                _draw_device_row(stdscr, display_row, W, row_str)
+                display_row += 1
             else:
                 ch_marker = ">" if is_sel else " "
                 dev_display = name[:32] if ch == 0 else ""
@@ -786,7 +814,11 @@ def cmd_calibrate_device(args) -> int:
                 _draw_device_row(stdscr, display_row, W, row_str)
                 display_row += 1
 
-        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   f: force_mode")
+            if is_last and display_row < content_end:
+                line(display_row)
+                display_row += 1
+
+        line(H - 3, f"Up/Dn: row   Lft/Rgt: field   +/-: value   Tab: step ({step_size:.3f})   f: force_mode   z: zones")
         line(H - 2, hint2)
         try:
             stdscr.addstr(H - 1, 0, ("+" + "-" * (W - 2) + "+")[:W])
@@ -817,8 +849,18 @@ def cmd_calibrate_device(args) -> int:
 
     result: dict | None = None
 
+    def _merged_dev_state() -> dict:
+        merged = {}
+        for k, dc in dev_state.items():
+            m = dict(dc)
+            zs = {zn: dict(zc) for zn, zc in zone_state.get(k, {}).items() if zc["skip"]}
+            if zs:
+                m["zones"] = zs
+            merged[k] = m
+        return merged
+
     def run_tui(stdscr) -> bool:
-        nonlocal result
+        nonlocal result, rows
         curses.curs_set(0)
         stdscr.keypad(True)
         row_idx = field_idx = step_size_idx = 0
@@ -837,17 +879,30 @@ def cmd_calibrate_device(args) -> int:
             while _visual_h(view_start, ri + 1) > content_h and view_start < ri:
                 view_start += 1
 
+        def _req(r, g, b):
+            preview.request(r * preview_brightness, g * preview_brightness, b * preview_brightness,
+                            _merged_dev_state(), gc={"saturation": preview_saturation})
+
+        def _toggle_zones(ri):
+            nonlocal rows
+            name = rows[ri][0]
+            if dev_zones.get(name):
+                zones_expanded[name] = not zones_expanded.get(name, False)
+                rows[:] = build_rows()
+                return min(ri, len(rows) - 1)
+            return ri
+
         if smooth:
             hue = 0.0
             sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                            dev_state, gc={"saturation": preview_saturation})
+            _req(sr, sg, sb)
 
             while True:
                 draw_smooth(stdscr, hue, row_idx, field_idx, step_size_idx, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
-                name, ch = rows[row_idx]
+                row = rows[row_idx]
+                name, ch = row[0], row[1]
                 dc = dev_state[name]
 
                 if key == ord('q'):
@@ -863,54 +918,53 @@ def cmd_calibrate_device(args) -> int:
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
                     update_view(row_idx)
-                elif key == curses.KEY_RIGHT:
+                elif key == curses.KEY_RIGHT and ch not in ("force", "zone"):
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key == curses.KEY_LEFT:
+                elif key == curses.KEY_LEFT and ch not in ("force", "zone"):
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
+                elif key == ord('z'):
+                    row_idx = _toggle_zones(row_idx)
+                    update_view(row_idx)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
                 elif key == ord('s'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
                 elif key == ord('a'):
                     hue = (hue - HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
                 elif key == ord('d'):
                     hue = (hue + HUE_STEP / 360.0) % 1.0
                     sr, sg, sb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
+                elif ch == "zone" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
+                    zone_state[name][row[2]]["skip"] = not zone_state[name][row[2]]["skip"]
+                    _req(sr, sg, sb)
                 elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
                     dc["force_mode"] = not dc.get("force_mode", False)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('='), ord('+')) and ch != "force":
+                    _req(sr, sg, sb)
+                elif key in (ord('='), ord('+')) and ch not in ("force", "zone"):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('-'), ord('_')) and ch != "force":
+                    _req(sr, sg, sb)
+                elif key in (ord('-'), ord('_')) and ch not in ("force", "zone"):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
 
         else:
             step_idx = 0
             label, sr, sg, sb = CAL_STEPS[step_idx]
-            preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                            dev_state, gc={"saturation": preview_saturation})
+            _req(sr, sg, sb)
 
             while step_idx < len(CAL_STEPS):
                 draw_step(stdscr, step_idx, row_idx, field_idx, step_size_idx, view_start)
                 key = stdscr.getch()
                 step_size = STEPS[step_size_idx]
-                name, ch = rows[row_idx]
+                row = rows[row_idx]
+                name, ch = row[0], row[1]
                 dc = dev_state[name]
 
                 if key == ord('q'):
@@ -920,8 +974,7 @@ def cmd_calibrate_device(args) -> int:
                     step_idx += 1
                     if step_idx < len(CAL_STEPS):
                         label, sr, sg, sb = CAL_STEPS[step_idx]
-                        preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                        dev_state, gc={"saturation": preview_saturation})
+                        _req(sr, sg, sb)
                         row_idx = field_idx = view_start = 0
                 elif key == curses.KEY_DOWN:
                     row_idx = (row_idx + 1) % len(rows)
@@ -929,32 +982,33 @@ def cmd_calibrate_device(args) -> int:
                 elif key == curses.KEY_UP:
                     row_idx = (row_idx - 1) % len(rows)
                     update_view(row_idx)
-                elif key in (curses.KEY_RIGHT, ord('d')):
+                elif key in (curses.KEY_RIGHT, ord('d')) and ch not in ("force", "zone"):
                     field_idx = (field_idx + 1) % len(DEVICE_FIELDS)
-                elif key in (curses.KEY_LEFT, ord('a')):
+                elif key in (curses.KEY_LEFT, ord('a')) and ch not in ("force", "zone"):
                     field_idx = (field_idx - 1) % len(DEVICE_FIELDS)
                 elif key == ord('w'):
                     preview_brightness = min(1.0, round(preview_brightness + 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
                 elif key == ord('s'):
                     preview_brightness = max(0.05, round(preview_brightness - 0.05, 2))
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
                 elif key == ord('\t'):
                     step_size_idx = (step_size_idx + 1) % len(STEPS)
+                elif key == ord('z'):
+                    row_idx = _toggle_zones(row_idx)
+                    update_view(row_idx)
+                elif ch == "zone" and key in (ord('f'), ord('='), ord('+'), ord('-'), ord('_'), ord(' ')):
+                    zone_state[name][row[2]]["skip"] = not zone_state[name][row[2]]["skip"]
+                    _req(sr, sg, sb)
                 elif key == ord('f') or (ch == "force" and key in (ord('='), ord('+'), ord('-'), ord('_'))):
                     dc["force_mode"] = not dc.get("force_mode", False)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('='), ord('+')) and ch != "force":
+                    _req(sr, sg, sb)
+                elif key in (ord('='), ord('+')) and ch not in ("force", "zone"):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(dc[DEVICE_FIELDS[field_idx]][ch] + step_size, 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
-                elif key in (ord('-'), ord('_')) and ch != "force":
+                    _req(sr, sg, sb)
+                elif key in (ord('-'), ord('_')) and ch not in ("force", "zone"):
                     dc[DEVICE_FIELDS[field_idx]][ch] = round(max(0.0, dc[DEVICE_FIELDS[field_idx]][ch] - step_size), 4)
-                    preview.request(sr * preview_brightness, sg * preview_brightness, sb * preview_brightness,
-                                    dev_state, gc={"saturation": preview_saturation})
+                    _req(sr, sg, sb)
 
             preview.stop()
             result = dev_state
@@ -995,6 +1049,11 @@ def cmd_calibrate_device(args) -> int:
         new_cfg["devices"][name]["black_point"] = dc["black_point"]
         new_cfg["devices"][name]["fast"]        = dc["fast"]
         new_cfg["devices"][name]["force_mode"]  = dc.get("force_mode", False)
+        skipped = {zn: {"skip": True} for zn, zc in zone_state.get(name, {}).items() if zc["skip"]}
+        if skipped:
+            new_cfg["devices"][name]["zones"] = skipped
+        else:
+            new_cfg["devices"][name].pop("zones", None)
 
     save_config(new_cfg)
     restore_wallpaper(client, load_config())
